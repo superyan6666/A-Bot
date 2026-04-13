@@ -7,6 +7,7 @@ import time
 import json
 from datetime import datetime, timedelta
 import pytz
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ================= 配置区 =================
 TZ_BJS = pytz.timezone('Asia/Shanghai') # 设置时区为北京时间
@@ -78,6 +79,20 @@ def fetch_hist_data(code, start_date, end_date, retries=3):
             time.sleep(0.5)
     return None
 
+def fetch_single_stock_data(code, start_date_str, end_date_str):
+    """用于线程池的单个股票数据获取包装函数"""
+    hist = fetch_hist_data(code, start_date_str, end_date_str)
+    return code, hist
+
+def get_stock_sector(code):
+    """【新增】获取个股所属板块/行业信息"""
+    try:
+        df = ak.stock_individual_info_em(symbol=code)
+        industry = df[df['item'] == '行业']['value'].values[0]
+        return industry if pd.notna(industry) else "核心概念"
+    except Exception:
+        return "热门题材"
+
 def calculate_target_points(current_price, today_low, ma20, max_250_high):
     stop_loss = min(today_low, ma20)
     stop_loss = round(stop_loss * 0.99, 2)
@@ -85,24 +100,46 @@ def calculate_target_points(current_price, today_low, ma20, max_250_high):
         stop_loss = round(current_price * 0.95, 2)
         
     risk_value = current_price - stop_loss
+    # 【新增资金管理维度】：计算现价到止损位的回撤风险百分比
+    risk_percent = (risk_value / current_price) * 100 
+    
     target_1 = round(current_price + risk_value * 2.0, 2)
     target_2 = round(max(max_250_high, target_1 * 1.15), 2)
-    return stop_loss, target_1, target_2
+    return stop_loss, target_1, target_2, risk_percent
 
-def generate_reason_and_score(price_percentile, vol_ratio, vcp_amplitude, upper_shadow_ratio, has_zt_gene):
+def get_position_advice(score, risk_percent):
+    """【新增】基于胜率(打分)与赔率(回撤风险)的动态仓位管理系统"""
+    if score >= 85:
+        base_pos = 30
+        tag = "重仓狙击"
+    elif score >= 75:
+        base_pos = 20
+        tag = "标准配置"
+    else:
+        base_pos = 10
+        tag = "轻仓试错"
+
+    # 风控惩罚机制：如果单笔止损风险过大(>8%)，强制仓位减半
+    if risk_percent > 8.0:
+        final_pos = base_pos // 2
+        return f"⚠️ 建议 {final_pos}% 仓位 (原定{tag}，但单笔止损风险高达 {risk_percent:.1f}%，触发风控减半！)"
+    else:
+        return f"⚖️ 建议 {base_pos}% 仓位 ({tag}，单笔止损风险控制在极佳的 {risk_percent:.1f}%)"
+
+def generate_reason_and_score(price_percentile, vol_ratio, vcp_amplitude, upper_shadow_ratio, has_zt_gene, has_macd_div, has_rsi_oversold, has_chip_breakthrough, has_obv_breakout, has_60d_breakout, has_gap_up):
     score = 40
     reasons = []
 
     perc = price_percentile * 100
     if perc < 15:
         score += 15
-        reasons.append(f"🟢 【长线潜伏】处于3年极度冰点(分位{perc:.1f}%)，下方支撑极强，性价比爆棚。")
+        reasons.append(f"🟢 【波段潜伏】处于近1年极度冰点(分位{perc:.1f}%)，下方支撑极强，性价比爆棚。")
     elif perc < 30:
         score += 10
-        reasons.append(f"🟢 【长线底部】处于3年底部区域(分位{perc:.1f}%)，趋势反转确立。")
+        reasons.append(f"🟢 【波段底部】处于近1年底部区域(分位{perc:.1f}%)，趋势反转确立。")
     else:
         score += 5
-        reasons.append(f"🟡 【中位起涨】处于历史中低位(分位{perc:.1f}%)，属于波段加速期。")
+        reasons.append(f"🟡 【中位起涨】处于近1年中低位(分位{perc:.1f}%)，属于波段加速期。")
 
     vcp = vcp_amplitude * 100
     if vcp < 10:
@@ -131,6 +168,35 @@ def generate_reason_and_score(price_percentile, vol_ratio, vcp_amplitude, upper_
         score += 5
         reasons.append(f"🔴 【实体推升】上影线极短(比例{shadow:.1f}%)，多头控盘能力强。")
 
+    # 【新增】三大高阶指标加分项：核武级共振
+    if has_chip_breakthrough:
+        score += 15
+        reasons.append("🏔️ 【跨越筹码峰】今日强势突破近半年核心筹码密集区，上方套牢盘抛压一扫而空，主升浪空间彻底打开！")
+        
+    if has_macd_div:
+        score += 10
+        reasons.append("💥 【底背离共振】近期呈现标准MACD底背离形态，杀跌动能枯竭，反转信号极其强烈。")
+        
+    if has_rsi_oversold:
+        score += 5
+        reasons.append("📉 【超卖反弹】前期RSI曾触及极度超卖区，空头情绪宣泄完毕，底部夯实。")
+
+    # 【新增】三大Alpha胜率挖掘加分项：主力资金轨迹
+    if has_60d_breakout:
+        score += 15
+        reasons.append("🚀 【箱体突破】一举跃过近60日波段前高，呈现经典'N字型'主升浪突破形态，上攻意愿极其坚决！")
+        
+    if has_obv_breakout:
+        score += 10
+        reasons.append("💸 【量能先行】OBV(能量潮)创出阶段新高，量在价先，揭示主力资金近期一直在暗中吃货吸筹！")
+        
+    if has_gap_up:
+        score += 5
+        reasons.append("⚡ 【跳空抢筹】今日早盘呈现跳空高开缺口且未回补，集合竞价阶段多头已呈碾压逼空之势。")
+
+    # 分数封顶 100 分
+    score = min(score, 100)
+
     if score >= 85:
         level = "⭐⭐⭐⭐⭐ [S级极品]"
     elif score >= 75:
@@ -155,39 +221,70 @@ def get_signals():
     already_pushed = load_pushed_state()
     df_spot = ak.stock_zh_a_spot_em()
     
-    df_spot = df_spot.dropna(subset=['最新价', '最高', '涨跌幅', '换手率', '代码', '名称', '流通市值', '市盈率-动态', '市净率'])
+    # 增加 '成交额' 和 '量比' 字段以进行流动性过滤
+    df_spot = df_spot.dropna(subset=['最新价', '最高', '涨跌幅', '换手率', '成交额', '量比', '代码', '名称', '流通市值', '市盈率-动态', '市净率'])
     df_spot = df_spot[~df_spot['名称'].str.contains('ST|退')]
     df_spot = df_spot[~df_spot['代码'].isin(already_pushed)]
     
     market_cap_condition = (df_spot['流通市值'] >= 30 * 10**8) & (df_spot['流通市值'] <= 300 * 10**8)
     fundamental_condition = (df_spot['市盈率-动态'] > 0) & (df_spot['市盈率-动态'] < 60) & (df_spot['市净率'] > 0) & (df_spot['市净率'] < 5)
-    turnover_condition = df_spot['换手率'] >= 2.0
     
-    pool_condition = (df_spot['涨跌幅'] >= 3.5) & market_cap_condition & fundamental_condition & turnover_condition
+    # 【提速优化核心区】：收紧初筛漏斗，过滤跟风弱势股
+    turnover_condition = df_spot['换手率'] >= 3.0       # 换手率从 2.0 提高到 3.0
+    amount_condition = df_spot['成交额'] >= 100000000    # 成交额必须大于 1 亿元
+    rise_condition = df_spot['涨跌幅'] >= 4.5           # 涨幅从 3.5 提高到 4.5
+    vr_condition = (df_spot['量比'] >= 1.2) & (df_spot['量比'] <= 5.0) # 【新增】盘中量比预过滤，拦截无效计算
+    
+    pool_condition = rise_condition & market_cap_condition & fundamental_condition & turnover_condition & amount_condition & vr_condition
     target_pool = df_spot[pool_condition].copy()
     
     total_count = len(target_pool)
-    print(f"✅ 初筛完毕！发现 {total_count} 只符合【换手异动+基本面健康】的股票。进入深度量价模型...")
+    print(f"✅ 初筛完毕！发现 {total_count} 只符合【高活跃+强异动+基本面健康】的精选股票。")
     
     if total_count == 0:
         return pd.DataFrame(), already_pushed, 0
 
     end_date_str = now.strftime("%Y%m%d")
-    start_date_str = (now - timedelta(days=1095)).strftime("%Y%m%d")
+    # 【优化点】：缩短回溯窗口至 400 天，减少数据冗余与计算开销
+    start_date_str = (now - timedelta(days=400)).strftime("%Y%m%d")
     passed_mins = get_passed_trading_mins(now)
     vol_scale_factor = 240 / passed_mins if passed_mins > 0 else 1.0
     
+    # --- 并发拉取历史数据 ---
+    print(f"🔄 正在启动并发拉取 {total_count} 只股票的历史数据，请稍候...")
+    codes = target_pool['代码'].tolist()
+    hist_dict = {}
+    
+    # 使用 5 个线程，以避免瞬间高频请求触发源站限流
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        future_to_code = {
+            executor.submit(fetch_single_stock_data, code, start_date_str, end_date_str): code
+            for code in codes
+        }
+        for future in as_completed(future_to_code):
+            try:
+                code_res, hist = future.result()
+                if hist is not None and len(hist) >= 250:
+                    hist_dict[code_res] = hist
+            except Exception as e:
+                pass
+                
+    print(f"📥 历史数据拉取完成，成功获取 {len(hist_dict)} 只股票的有效数据。开始逐一测算...")
+
     final_signals = []
     
+    # --- 核心量价模型测算 (纯 CPU 计算) ---
     for idx, (index, row) in enumerate(target_pool.iterrows(), 1):
         code = row['代码']
         name = row['名称']
         
+        # 已经在多线程里拉取失败或数据不够长度的，直接跳过
+        if code not in hist_dict:
+            continue
+            
         try:
-            hist = fetch_hist_data(code, start_date_str, end_date_str)
-            if hist is None or len(hist) < 250: 
-                continue
-                
+            hist = hist_dict[code]
+            
             hist['PCT_CHG'] = (hist['收盘'] - hist['收盘'].shift(1)) / hist['收盘'].shift(1) * 100
             hist['MA20'] = hist['收盘'].rolling(window=20).mean()
             hist['MA60'] = hist['收盘'].rolling(window=60).mean()
@@ -207,14 +304,60 @@ def get_signals():
             hist['REF_上'] = hist['上'].shift(1)
             
             today = hist.iloc[-1]
-            min_3y = hist['最低'].min()
-            max_3y = hist['最高'].max()
-            max_1y = hist['最高'].iloc[-250:].max() 
-            price_range = max_3y - min_3y
+            
+            # 【新增 Alpha 1】：计算 OBV (能量潮) 资金潜伏
+            hist['OBV'] = np.where(hist['收盘'] > hist['REF_C'], hist['成交量'], 
+                                   np.where(hist['收盘'] < hist['REF_C'], -hist['成交量'], 0)).cumsum()
+            has_obv_breakout = hist['OBV'].iloc[-1] > hist['OBV'].iloc[-21:-1].max()
+
+            # 【新增 Alpha 2】：计算 60日N字箱体突破
+            recent_60_high = hist['最高'].iloc[-61:-1].max()
+            has_60d_breakout = (today['收盘'] > recent_60_high) and (today['REF_C'] <= recent_60_high)
+            
+            # 【新增 Alpha 3】：计算 集合竞价跳空缺口
+            yesterday_high = hist['最高'].iloc[-2]
+            has_gap_up = today['开盘'] > yesterday_high
+
+            # 【新增】：1. 计算 RSI (14日)
+            delta = hist['收盘'].diff()
+            gain = delta.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
+            loss = -1 * delta.clip(upper=0).ewm(alpha=1/14, adjust=False).mean()
+            rs = gain / loss
+            hist['RSI'] = 100 - (100 / (1 + rs))
+            has_rsi_oversold = hist['RSI'].iloc[-15:-1].min() < 30 # 近15天内曾跌破30超卖线
+            
+            # 【新增】：2. 计算 MACD 底背离 (对比近40天内的两段低谷)
+            window1 = hist.iloc[-40:-20]
+            window2 = hist.iloc[-20:-1]
+            if not window1.empty and not window2.empty:
+                min_p1, min_p2 = window1['最低'].min(), window2['最低'].min()
+                min_macd1, min_macd2 = window1['DIF'].min(), window2['DIF'].min()
+                # 价格创新低，但MACD(DIF)未创新低，形成底背离
+                has_macd_div = (min_p2 < min_p1) and (min_macd2 > min_macd1)
+            else:
+                has_macd_div = False
+                
+            # 【新增】：3. 计算 筹码峰突破 (近半年约120个交易日)
+            recent_120 = hist.iloc[-121:-1]
+            if len(recent_120) > 20:
+                # 将价格切分为20个区间，统计每个区间的成交量，找出最大值即为“筹码密集峰(POC)”
+                bins = pd.cut(recent_120['收盘'], bins=20)
+                volume_by_price = recent_120.groupby(bins, observed=True)['成交量'].sum()
+                poc_bin = volume_by_price.idxmax()
+                poc_price = poc_bin.mid # 筹码峰核心价位
+                # 昨天还在筹码峰下方，今天一举突破！
+                has_chip_breakthrough = (today['REF_C'] <= poc_price) and (today['收盘'] > poc_price)
+            else:
+                has_chip_breakthrough = False
+            
+            # 【优化点】：配合 400 天窗口，将分位计算改为 1年内最高最低
+            min_1y = hist['最低'].min()
+            max_1y = hist['最高'].max()
+            price_range = max_1y - min_1y
             
             if price_range <= 0: continue
             
-            price_percentile = (today['收盘'] - min_3y) / price_range
+            price_percentile = (today['收盘'] - min_1y) / price_range
             recent_10_high = hist['最高'].iloc[-11:-1].max()
             recent_10_low = hist['最低'].iloc[-11:-1].min()
             vcp_amplitude = (recent_10_high - recent_10_low) / recent_10_low
@@ -233,23 +376,33 @@ def get_signals():
             
             if is_bull_trend and is_macd_bull and is_cross and (1.2 < vol_ratio < 5.0) and (price_percentile < 0.45):
                 score, level, reason_text = generate_reason_and_score(
-                    price_percentile, vol_ratio, vcp_amplitude, upper_shadow_ratio, has_zt_gene
+                    price_percentile, vol_ratio, vcp_amplitude, upper_shadow_ratio, has_zt_gene,
+                    has_macd_div, has_rsi_oversold, has_chip_breakthrough, 
+                    has_obv_breakout, has_60d_breakout, has_gap_up
                 )
                 
-                stop_loss, target_1, target_2 = calculate_target_points(
+                # 获取点位与风险率
+                stop_loss, target_1, target_2, risk_percent = calculate_target_points(
                     current_price=row['最新价'], 
                     today_low=today['最低'], 
                     ma20=today['MA20'], 
                     max_250_high=max_1y
                 )
                 
+                # 生成仓位与风控建议
+                position_advice = get_position_advice(score, risk_percent)
+                
+                sector = get_stock_sector(code)
+                
                 final_signals.append({
                     '代码': code,
                     '名称': name,
                     '现价': row['最新价'],
                     '涨幅': f"{row['涨跌幅']}%",
+                    '板块': sector,
                     '评分': score,
                     '评级': level,
+                    '仓位建议': position_advice,
                     '触发时间': now.strftime("%H:%M"),
                     '选股逻辑': reason_text,
                     '止损点': stop_loss,
@@ -257,14 +410,11 @@ def get_signals():
                     '目标2': target_2
                 })
                 already_pushed.add(code)
-            
-            # 不再打印冗长的单只股票解析，交给进度条
-            time.sleep(0.05)
-            
+                
         except Exception as e:
             continue
 
-    print(f"📊 所有历史数据计算完成！")
+    print(f"📊 所有历史数据测算完成！")
     result_df = pd.DataFrame(final_signals)
     if not result_df.empty:
         result_df = result_df.sort_values(by='评分', ascending=False)
@@ -299,11 +449,13 @@ def send_dingtalk_msg(data_df, total_count):
         message = f"🤖 AI 量化执行纪律单 ({title_tag}) {now_str}\n\n"
         for _, row in data_df.iterrows():
             message += f"【{row['名称']} ({row['代码']})】\n"
-            message += f"📊 评分：{row['评分']}分 {row['评级']}\n"
-            message += f"💰 现价：¥{row['现价']} ({row['涨幅']})\n"
+            message += f"🏷️ 所属板块：{row['板块']} (若迎合今日主线，溢价极高)\n"
+            message += f"📊 综合评分：{row['评分']}分 {row['评级']}\n"
+            message += f"💰 当前现价：¥{row['现价']} ({row['涨幅']})\n"
             message += "--- 📝 核心交易逻辑 ---\n"
             message += f"{row['选股逻辑']}\n"
-            message += "--- 🎯 操作点位计划 ---\n"
+            message += "--- 💼 资金与点位管理 ---\n"
+            message += f"{row['仓位建议']}\n"
             message += f"🛑 防守止损：¥{row['止损点']} (破今日底/20日线离场)\n"
             message += f"🥇 第一止盈：¥{row['目标1']} (盈亏比 1:2 减仓点)\n"
             message += f"🚀 终极目标：¥{row['目标2']} (大波段年内前高)\n"

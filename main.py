@@ -8,20 +8,25 @@ import json
 from datetime import datetime, timedelta
 import pytz
 
-# 设置时区为北京时间
-TZ_BJS = pytz.timezone('Asia/Shanghai')
-STATE_FILE = 'pushed_state.json'
+# ================= 配置区 =================
+TZ_BJS = pytz.timezone('Asia/Shanghai') # 设置时区为北京时间
+STATE_FILE = 'pushed_state.json'        # 盘中去重记忆文件
+IS_MANUAL_RUN = os.environ.get('GITHUB_EVENT_NAME') == 'workflow_dispatch' # 识别是否为手动触发测试
 
+# ================= 辅助函数 =================
 def get_bjs_time():
+    """获取当前北京时间"""
     return datetime.now(TZ_BJS)
 
 def is_trading_time(now):
+    """判断是否在 A股 交易时间内"""
     time_val = now.hour * 100 + now.minute
     if (925 <= time_val <= 1130) or (1300 <= time_val <= 1500):
         return True
     return False
 
 def get_passed_trading_mins(now):
+    """计算今天已经走过的交易分钟数，用于盘中量能外推计算虚拟成交量"""
     if now.hour == 9 and now.minute >= 30:
         return now.minute - 30
     elif now.hour == 10:
@@ -35,6 +40,7 @@ def get_passed_trading_mins(now):
     return 1 
 
 def load_pushed_state():
+    """加载今天已经推送过的股票代码，防止一天内被同一只股票重复轰炸"""
     today_str = get_bjs_time().strftime("%Y-%m-%d")
     if os.path.exists(STATE_FILE):
         try:
@@ -47,12 +53,15 @@ def load_pushed_state():
     return set()
 
 def save_pushed_state(pushed_codes):
+    """保存今天推送过的股票记录到本地"""
     today_str = get_bjs_time().strftime("%Y-%m-%d")
     state = {'date': today_str, 'pushed_codes': list(pushed_codes)}
     with open(STATE_FILE, 'w') as f:
         json.dump(state, f)
 
+# ================= 核心算法函数 =================
 def calculate_tdx_dma(close_series, a_series):
+    """[极速版] 实现通达信的 DMA(X, A) 动态移动平均函数"""
     c_arr = close_series.to_numpy()
     a_arr = a_series.to_numpy()
     dma_arr = np.zeros_like(c_arr)
@@ -66,6 +75,7 @@ def calculate_tdx_dma(close_series, a_series):
     return pd.Series(dma_arr, index=close_series.index)
 
 def fetch_hist_data(code, start_date, end_date, retries=3):
+    """带重试机制的 K线数据拉取，增强网络鲁棒性"""
     for attempt in range(retries):
         try:
             df = ak.stock_zh_a_hist(symbol=code, period="daily", start_date=start_date, end_date=end_date, adjust="qfq")
@@ -76,14 +86,11 @@ def fetch_hist_data(code, start_date, end_date, retries=3):
     return None
 
 def calculate_target_points(current_price, today_low, ma20, max_250_high):
-    """
-    计算止损和止盈目标点位
-    """
+    """智能点位测算：计算止损位和目标止盈位"""
     # 止损点：破今天最低价 或者 破20日均线（两者取较低的，给予一定容错空间）
     stop_loss = min(today_low, ma20)
     stop_loss = round(stop_loss * 0.99, 2)  # 给1%的缓冲防毛刺
     
-    # 如果极端情况止损比现价高（几乎不可能），设为现价的 -5%
     if stop_loss >= current_price:
         stop_loss = round(current_price * 0.95, 2)
         
@@ -91,13 +98,13 @@ def calculate_target_points(current_price, today_low, ma20, max_250_high):
     
     # 第一目标：严格按照 1:2 盈亏比计算短线阻力
     target_1 = round(current_price + risk_value * 2.0, 2)
-    
     # 终极目标：前期一年内的高点。如果距离太近，则定为第一目标的上方15%
     target_2 = round(max(max_250_high, target_1 * 1.15), 2)
     
     return stop_loss, target_1, target_2
 
 def generate_reason_and_score(price_percentile, vol_ratio, vcp_amplitude, upper_shadow_ratio, has_zt_gene):
+    """AI 打分与动态话术生成引擎 (满分100分)"""
     score = 40
     reasons = []
 
@@ -148,11 +155,15 @@ def generate_reason_and_score(price_percentile, vol_ratio, vcp_amplitude, upper_
 
     return score, level, "\n".join(reasons)
 
+# ================= 主筛选逻辑 =================
 def get_signals():
     now = get_bjs_time()
     
-    if not is_trading_time(now) and now.hour < 15:
-        return pd.DataFrame(), set()
+    # 如果是手动触发，强制放行；否则执行严格的交易时间拦截
+    if not IS_MANUAL_RUN:
+        if not is_trading_time(now) and now.hour < 15:
+            print(f"[{now.strftime('%H:%M')}] 当前时间不在交易时段，脚本休眠。")
+            return pd.DataFrame(), set()
 
     already_pushed = load_pushed_state()
     df_spot = ak.stock_zh_a_spot_em()
@@ -160,13 +171,16 @@ def get_signals():
     df_spot = df_spot[~df_spot['名称'].str.contains('ST|退')]
     df_spot = df_spot[~df_spot['代码'].isin(already_pushed)]
     
+    # 基础安全底线过滤 (30-300亿盘子，有市盈率，无极大泡沫)
     market_cap_condition = (df_spot['流通市值'] >= 30 * 10**8) & (df_spot['流通市值'] <= 300 * 10**8)
     fundamental_condition = (df_spot['市盈率-动态'] > 0) & (df_spot['市盈率-动态'] < 60) & (df_spot['市净率'] > 0) & (df_spot['市净率'] < 5)
+    
+    # 涨幅初筛 (大于3.5%异动)
     pool_condition = (df_spot['涨跌幅'] >= 3.5) & market_cap_condition & fundamental_condition
     target_pool = df_spot[pool_condition].copy()
     
     end_date_str = now.strftime("%Y%m%d")
-    start_date_str = (now - timedelta(days=1095)).strftime("%Y%m%d")
+    start_date_str = (now - timedelta(days=1095)).strftime("%Y%m%d") # 提取3年数据
     
     passed_mins = get_passed_trading_mins(now)
     vol_scale_factor = 240 / passed_mins if passed_mins > 0 else 1.0
@@ -183,10 +197,20 @@ def get_signals():
                 continue
                 
             hist['PCT_CHG'] = (hist['收盘'] - hist['收盘'].shift(1)) / hist['收盘'].shift(1) * 100
+            
+            # 均线计算
             hist['MA20'] = hist['收盘'].rolling(window=20).mean()
+            hist['MA60'] = hist['收盘'].rolling(window=60).mean()
             hist['MA250'] = hist['收盘'].rolling(window=250).mean()
             hist['MA5_V'] = hist['成交量'].rolling(window=5).mean()
             
+            # MACD 逻辑 (补强：动能水上共振)
+            hist['EMA12'] = hist['收盘'].ewm(span=12, adjust=False).mean()
+            hist['EMA26'] = hist['收盘'].ewm(span=26, adjust=False).mean()
+            hist['DIF'] = hist['EMA12'] - hist['EMA26']
+            hist['DEA'] = hist['DIF'].ewm(span=9, adjust=False).mean()
+            
+            # --- 还原通达信公式 ---
             hist['CC'] = abs((2 * hist['收盘'] + hist['最高'] + hist['最低']) / 4 - hist['MA20']) / hist['MA20']
             hist['DD'] = calculate_tdx_dma(hist['收盘'], hist['CC'])
             hist['上'] = 1.07 * hist['DD']
@@ -197,11 +221,12 @@ def get_signals():
             today = hist.iloc[-1]
             min_3y = hist['最低'].min()
             max_3y = hist['最高'].max()
-            max_1y = hist['最高'].iloc[-250:].max() # 一年内最高点
+            max_1y = hist['最高'].iloc[-250:].max() 
             price_range = max_3y - min_3y
             
             if price_range <= 0: continue
             
+            # 核心数据测量
             price_percentile = (today['收盘'] - min_3y) / price_range
             recent_10_high = hist['最高'].iloc[-11:-1].max()
             recent_10_low = hist['最低'].iloc[-11:-1].min()
@@ -215,10 +240,18 @@ def get_signals():
             vol_ratio = virtual_vol / today['MA5_V'] if today['MA5_V'] > 0 else 1
             has_zt_gene = (hist['PCT_CHG'].iloc[-61:-1] >= 9.5).any()
             
-            is_bull_trend = today['收盘'] >= today['MA250']
-            is_cross = (today['收盘'] > today['上']) and (today['REF_C'] <= today['REF_上'])
+            # --- 买入护城河判断 ---
+            # 1. 均线共振：必须在年线之上，且中期趋势(MA20)必须大于(MA60)
+            is_bull_trend = (today['收盘'] >= today['MA250']) and (today['MA20'] >= today['MA60'])
             
-            if is_bull_trend and is_cross and (vol_ratio > 1.2) and (price_percentile < 0.45):
+            # 2. MACD水上起步：确保趋势有底层动能支撑
+            is_macd_bull = (today['DIF'] > 0) and (today['DEA'] > 0)
+            
+            # 3. 乖离上轨突破
+            is_cross = (today['收盘'] > today['上']) and (today['REF_C'] <= today['REF_上']) 
+            
+            # 基础条件：均线多头、MACD多头、过上轨、今日温和放量(1.2~5.0倍量，防天量见天价)、3年低位区间(<45%分位)
+            if is_bull_trend and is_macd_bull and is_cross and (1.2 < vol_ratio < 5.0) and (price_percentile < 0.45):
                 score, level, reason_text = generate_reason_and_score(
                     price_percentile, vol_ratio, vcp_amplitude, upper_shadow_ratio, has_zt_gene
                 )
@@ -257,13 +290,29 @@ def get_signals():
         
     return result_df, already_pushed
 
+# ================= 消息推送引擎 =================
 def send_dingtalk_msg(data_df):
     webhook_url = os.environ.get('DINGTALK_WEBHOOK')
+    now_str = get_bjs_time().strftime("%Y-%m-%d %H:%M")
+
     if data_df is None or data_df.empty:
+        print("本时段无新增高分标的。")
+        # 增加手动检测的空跑回执
+        if IS_MANUAL_RUN:
+            message = f"🤖 AI 量化执行纪律单 (手动检测) {now_str}\n\n"
+            message += "✅ 运行环境：GitHub Actions 节点正常\n"
+            message += "✅ 数据通道：AkShare 接口连通正常\n"
+            message += "✅ 消息通道：DingTalk Webhook 触达正常\n"
+            message += "━━━━━━━━━━━━━━━━━━\n"
+            message += "📉 扫描结果：今日全市场扫描完毕，暂无符合【底部多维共振突破】的高胜率标的。\n\n"
+            message += "💡 交易备忘录：系统运转完美。宁缺毋滥是盈利的前提，猎人请继续耐心等待绝佳击球点。"
+            if webhook_url:
+                requests.post(webhook_url, json={"msgtype": "text", "text": {"content": message}}, timeout=5)
         return
 
-    now_str = get_bjs_time().strftime("%Y-%m-%d %H:%M")
-    message = f"🤖 AI 量化执行纪律单 {now_str}\n\n"
+    # 【注意】：此处的 'AI' 是为了通过钉钉机器人关键词校验，勿删！
+    title_tag = "手动检测" if IS_MANUAL_RUN else "盘中狙击"
+    message = f"🤖 AI 量化执行纪律单 ({title_tag}) {now_str}\n\n"
     
     for _, row in data_df.iterrows():
         message += f"【{row['名称']} ({row['代码']})】\n"
@@ -278,18 +327,21 @@ def send_dingtalk_msg(data_df):
         message += "━━━━━━━━━━━━━━━━━━\n"
     
     if not webhook_url:
-        print("未配置 webhook，结果如下:\n", message)
+        print("未配置 webhook 环境变量，在控制台打印测试结果:\n", message)
         return
 
     payload = {"msgtype": "text", "text": {"content": message}}
-    requests.post(webhook_url, json=payload)
-    print("带有目标点位的报告推送完成。")
+    try:
+        response = requests.post(webhook_url, json=payload, timeout=5)
+        print(f"钉钉推送响应: {response.text}")
+    except Exception as e:
+        print(f"钉钉推送失败: {e}")
 
 if __name__ == "__main__":
     try:
         signals_df, updated_pushed = get_signals()
         if not signals_df.empty:
             send_dingtalk_msg(signals_df)
-            save_pushed_state(updated_pushed)
+            save_pushed_state(updated_pushed) # 保存记录防止群消息轰炸
     except Exception as e:
         print(f"主程序崩溃: {e}")

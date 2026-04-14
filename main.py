@@ -18,7 +18,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as
 # ── 1. 环境与日志配置 ──────────────────────────────────────────────────────────
 TZ_BJS       = pytz.timezone('Asia/Shanghai')
 STATE_FILE   = 'pushed_state.json'
-# 预留给“接龙功能”：模拟账本文件
 TRADING_LOG  = 'trade_history.json' 
 IS_MANUAL    = os.environ.get('GITHUB_EVENT_NAME') == 'workflow_dispatch'
 IS_CI        = os.environ.get('GITHUB_ACTIONS') == 'true'
@@ -31,11 +30,33 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+# ── 状态管理函数 ──────────────────────────────────────────────────────────────
+def _today_str() -> str:
+    return datetime.now(TZ_BJS).strftime('%Y-%m-%d')
+
+def load_pushed_state() -> set:
+    today = _today_str()
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, 'r') as f:
+                state = json.load(f)
+            if state.get('date') == today:
+                return set(state.get('pushed_codes', []))
+        except Exception as e:
+            log.warning(f"读取推送记录失败: {e}")
+    return set()
+
+def save_pushed_state(codes: set) -> None:
+    try:
+        with open(STATE_FILE, 'w') as f:
+            json.dump({'date': _today_str(), 'pushed_codes': list(codes)}, f)
+    except Exception as e:
+        log.error(f"保存推送记录失败: {e}")
+
 
 # ── 2. 数据契约与配置 (Schema & Config) ────────────────────────────────────────
 @dataclass(frozen=True)
 class Cols:
-    """零魔术字符串：统一管理字段名，便于未来跨平台（如美股）快速适配"""
     S_PRICE: str = '最新价'
     S_HIGH: str  = '最高'
     S_LOW: str   = '最低'
@@ -59,6 +80,8 @@ class Cols:
     I_CLOSE: str = 'close'
     B_NAME: str  = '板块名称'
     B_PCT: str   = '涨跌幅'
+    INFO_ITEM: str = 'item'
+    INFO_VAL: str  = 'value'
 
 C = Cols()
 
@@ -74,7 +97,6 @@ class EnvParser:
 
 @dataclass(frozen=True)
 class Config:
-    # --- 核心策略参数：平衡“起爆灵敏度”与“右侧确认感” ---
     MIN_CAP: float       = field(default_factory=lambda: EnvParser.get_float('MIN_CAP', 20e8))
     MAX_CAP: float       = field(default_factory=lambda: EnvParser.get_float('MAX_CAP', 500e8))
     MIN_PE: float        = field(default_factory=lambda: EnvParser.get_float('MIN_PE', 0))
@@ -92,7 +114,6 @@ class Config:
 
 @dataclass
 class Signal:
-    """信号实体：不仅用于推送，也可直接序列化后用于模拟账本复盘"""
     code: str
     name: str
     price: float
@@ -110,9 +131,8 @@ class Signal:
     sector_pct: float = 0.0
 
 
-# ── 3. 数学与工具库 (MathUtils - 可再利用于回测引擎) ───────────────────────────
+# ── 3. 数学与工具库 (MathUtils) ────────────────────────────────────────────────
 class MathUtils:
-    """独立数学工具类，方便跨脚本复用"""
     @staticmethod
     def tdx_dma(close: pd.Series, alpha: pd.Series) -> pd.Series:
         c, a = close.to_numpy(), alpha.to_numpy()
@@ -174,7 +194,6 @@ def get_fund_flow_map() -> dict:
     try:
         df = ak.stock_individual_fund_flow_rank(indicator="今日")
         if df is None or df.empty: return {}
-        # 稳健的字段优先级匹配
         priority_targets = ['主力净流入-净额', '今日主力净流入净额', '主力净流入净额']
         col = next((c for c in priority_targets if c in df.columns), None)
         if not col:
@@ -185,9 +204,8 @@ def get_fund_flow_map() -> dict:
         return {}
 
 
-# ── 5. A 股指标引擎 (AShare Indicator Engine) ──────────────────────────────────
+# ── 5. 指标与评分引擎 (Core Logic) ───────────────────────────────────────────
 class AShareTechnicals:
-    """封装指标逻辑：可被实时监控或回测引擎重复实例化"""
     def __init__(self, df: pd.DataFrame):
         self.df = df.copy()
         close = self.df[C.H_CLOSE]
@@ -216,7 +234,6 @@ class AShareTechnicals:
         self.two_days_ago = self.df.iloc[-3] if len(self.df) >= 3 else None
 
     def get_features(self) -> Optional[dict]:
-        """特征提取流水线：兼顾过滤（Safety）与属性导出（Scoring）"""
         df, today, yest = self.df, self.today, self.yest
         if pd.isna(today['ATR']) or today['ATR'] <= 1e-5: return None
 
@@ -225,14 +242,13 @@ class AShareTechnicals:
         if rng <= 0: return None
         
         price_pct = (today[C.H_CLOSE] - min_1y) / rng
-        if price_pct > 0.85: return None # 避免历史高点风险
+        if price_pct > 0.85: return None
 
-        # 核心多头趋势判断
+        # 核心多头趋势 + 通道突破
         if not (today[C.H_CLOSE] >= today['MA60'] and today['DIF'] > -0.15): return None
-        # 突破确认：DMA 通道突破 + 1.2倍基准量能
         if not (today[C.H_CLOSE] > today['上'] and today[C.H_VOL] > today['MA20_V'] * 1.2): return None
 
-        # 筹码峰突破
+        # 筹码峰算法
         has_chip_break = False
         rec120 = df.iloc[-121:-1]
         if len(rec120) > 20 and rec120[C.H_VOL].sum() > 0:
@@ -257,8 +273,6 @@ class AShareTechnicals:
             'close_60d_ago': float(df[C.H_CLOSE].iloc[-60]) if len(df) >= 60 else 0.0,
         }
 
-
-# ── 5. 打分引擎 (Declarative Scoring Engine) ─────────────────────────────────
 @dataclass
 class Factor:
     condition: Callable[[dict], bool]
@@ -267,7 +281,6 @@ class Factor:
     template: str = ""
 
 def apply_scoring(data: dict) -> tuple[int, str, str]:
-    """评分逻辑：高度解耦，可接龙至 ML 模型预测概率"""
     adx = data['adx']
     tw, rw = (1.4, 0.7) if adx > 25 else (0.8, 1.4) if adx < 15 else (1.0, 1.0)
     meta = f"🧭 ADX={adx:.1f} {'【强趋势模式】' if adx > 25 else '【低位转强模式】' if adx < 15 else ''}"
@@ -288,7 +301,6 @@ def apply_scoring(data: dict) -> tuple[int, str, str]:
     ]
 
     score, reasons = 40, [meta] if meta else []
-    # 格式化预处理
     data['price_pct_pct'] = data['price_pct'] * 100
     data['vcp_amp_pct'] = data['vcp_amp'] * 100
     
@@ -302,11 +314,14 @@ def apply_scoring(data: dict) -> tuple[int, str, str]:
     return score, level, '\n'.join(reasons)
 
 
-# ── 6. 信号流水线 (Signal Pipeline) ──────────────────────────────────────────
+# ── 6. 核心分析流水线 (Signal Pipeline) ───────────────────────────────────────
+def is_trading_time(now: datetime) -> bool:
+    t = now.hour * 100 + now.minute
+    return (925 <= t <= 1135) or (1255 <= t <= 1505)
+
 def process_stock(row: pd.Series, raw_hist: pd.DataFrame, now: datetime, market_ok: bool, index_ret: float, flow: float) -> Optional[Signal]:
     if len(raw_hist) < 250: return None
     
-    # 缝合实时 Bar，确保早盘数据一致性
     hist = raw_hist.copy()
     if str(hist[C.H_DATE].iloc[-1]) != now.strftime('%Y-%m-%d') and is_trading_time(now):
         synthetic = pd.DataFrame([{
@@ -316,7 +331,6 @@ def process_stock(row: pd.Series, raw_hist: pd.DataFrame, now: datetime, market_
         }])
         hist = pd.concat([hist, synthetic], ignore_index=True)
 
-    # 预检：剔除缩量或未成交票
     if hist.iloc[-1][C.H_CLOSE] <= hist.iloc[-1][C.H_OPEN] or hist.iloc[-1][C.H_VOL] <= 0: return None
     
     engine = AShareTechnicals(hist)
@@ -335,11 +349,10 @@ def process_stock(row: pd.Series, raw_hist: pd.DataFrame, now: datetime, market_
     # 风险测算
     supports = [data['ma20_val'], data['recent_20_low'], data['boll_lower']]
     valid_supports = [s for s in supports if pd.notna(s) and s < row[C.S_PRICE]]
-    # 止损：支撑位或 7.5% 硬止损
     stop = max(valid_supports + [row[C.S_PRICE] * 0.925]) * 0.992
     risk_pct = ((row[C.S_PRICE] - stop) / row[C.S_PRICE]) * 100 if row[C.S_PRICE] > 0 else 99
     
-    if risk_pct > 8.5: return None # 盈亏比防守
+    if risk_pct > 8.5: return None
 
     pos = (30 if score >= 82 else 20 if score >= 72 else 10)
     if not market_ok: pos //= 2
@@ -354,10 +367,21 @@ def process_stock(row: pd.Series, raw_hist: pd.DataFrame, now: datetime, market_
     )
 
 
-# ── 7. 控制器 (Main Orchestrator) ───────────────────────────────────────────
-def is_trading_time(now: datetime) -> bool:
-    t = now.hour * 100 + now.minute
-    return (925 <= t <= 1135) or (1255 <= t <= 1505)
+# ── 7. 控制器与板块增强 (Orchestrator & Sector Bridge) ──────────────────────────
+def fetch_stock_sector(code: str) -> str:
+    """【通路修复】：补充获取个股所属行业信息"""
+    try:
+        df = ak.stock_individual_info_em(symbol=code)
+        v = df[df[C.INFO_ITEM] == '行业'][C.INFO_VAL].values[0]
+        return str(v) if pd.notna(v) else ""
+    except: return ""
+
+def fetch_sector_strength() -> dict:
+    """【通路修复】：获取全行业今日涨跌幅，用于强度背书"""
+    try:
+        df = ak.stock_board_industry_spot_em()
+        return dict(zip(df[C.B_NAME], df[C.B_PCT]))
+    except: return {}
 
 def extract_market_context(df_raw: pd.DataFrame, c_conf: Config) -> tuple[pd.DataFrame, bool, str, float]:
     if len(df_raw) < 1000: return pd.DataFrame(), False, "API 响应异常", 0.0
@@ -368,7 +392,7 @@ def extract_market_context(df_raw: pd.DataFrame, c_conf: Config) -> tuple[pd.Dat
         ma20 = cl.rolling(20).mean().iloc[-1]
         market_ok = (cl.iloc[-1] > ma20)
         market_msg = f"上证 {cl.iloc[-1]:.2f} {'(做多窗口)' if market_ok else '(防守窗口)'}"
-        index_ret = ((cl.iloc[-1] / cl.iloc[-60]) - 1) * 100
+        index_ret = ((cl.iloc[-1] / cl.iloc[-60]) - 1) * 100 if len(cl) >= 60 else 0.0
     except: pass
     df = df_raw.dropna(subset=list(c_conf.REQUIRED_COLS))
     df = df[~df[C.S_NAME].str.contains('ST|退')]
@@ -387,7 +411,6 @@ def get_signals() -> tuple[list[Signal], set, int]:
     df_clean, m_ok, m_msg, idx_ret = extract_market_context(df_raw, c_conf)
     log.info(f"📈 扫描中: {m_msg}")
 
-    # 初选过滤器
     mask = (df_clean[C.S_PCT] >= c_conf.MIN_PCT_CHG) & \
            (df_clean[C.S_MCAP].between(c_conf.MIN_CAP, c_conf.MAX_CAP)) & \
            (df_clean[C.S_TURN] >= c_conf.MIN_TURNOVER)
@@ -402,7 +425,7 @@ def get_signals() -> tuple[list[Signal], set, int]:
 
     log.info(f"✅ 初选捕获 {len(pool)} 只个股，正在并行深度计算指标...")
 
-    signals = []
+    initial_signals = []
     end_s, start_s = now.strftime('%Y%m%d'), (now - timedelta(days=450)).strftime('%Y%m%d')
     with ThreadPoolExecutor(max_workers=10) as ex:
         futures = {ex.submit(fetch_hist, r[C.S_CODE], start_s, end_s): r for _, r in pool.iterrows()}
@@ -411,14 +434,20 @@ def get_signals() -> tuple[list[Signal], set, int]:
             try:
                 hist = f.result(timeout=8)
                 sig = process_stock(row, hist, now, m_ok, idx_ret, flow_map.get(row[C.S_CODE], 0.0))
-                if sig:
-                    signals.append(sig)
-                    pushed.add(row[C.S_CODE])
+                if sig: initial_signals.append(sig)
             except Exception as e:
                 log.debug(f"流水线抛弃 {row[C.S_CODE]}: {e}")
 
-    signals.sort(key=lambda s: s.score, reverse=True)
-    return signals, pushed, len(pool)
+    # 【通路接龙】：后置填充板块强度，只针对通过筛选的极少数精英
+    if initial_signals:
+        sec_strengths = fetch_sector_strength()
+        for s in initial_signals:
+            s.sector = fetch_stock_sector(s.code)
+            s.sector_pct = sec_strengths.get(s.sector, 0.0)
+            pushed.add(s.code) # 正式加入已推送名单
+
+    initial_signals.sort(key=lambda x: x.score, reverse=True)
+    return initial_signals, pushed, len(pool)
 
 
 def send_dingtalk(signals: list[Signal], total: int) -> None:
@@ -430,8 +459,20 @@ def send_dingtalk(signals: list[Signal], total: int) -> None:
         if not (IS_MANUAL and PUSH_EMPTY): return
         content = f"{header}✅ 深度体检 {total} 只标的，未发现极致信号，系统待机中。"
     else:
-        # 接龙再利用：可以在这里将信号保存到本地 trade_history.json
-        parts = [f"【{s.name} ({s.code})】\n📊 评分：{s.score}分 {s.level}\n💰 现价：¥{s.price} ({s.pct_chg})\n--- 核心逻辑 ---\n{s.reasons}\n--- 资金管理 ---\n{s.position_advice}\n🛑 止损：¥{s.stop_loss}\n🥇 目标1：¥{s.target1}\n🔗 https://quote.eastmoney.com/unify/r/0.{s.code}\n" for s in signals]
+        parts = []
+        for s in signals:
+            sec_info = f"🏷️ 板块：{s.sector} (今日 {s.sector_pct:+.2f}%)\n" if s.sector else ""
+            parts.append(
+                f"【{s.name} ({s.code})】\n"
+                f"{sec_info}"
+                f"📊 评分：{s.score}分 {s.level}\n"
+                f"💰 现价：¥{s.price} ({s.pct_chg})\n"
+                f"--- 核心逻辑 ---\n{s.reasons}\n"
+                f"--- 资金管理 ---\n{s.position_advice}\n"
+                f"🛑 止损：¥{s.stop_loss}\n"
+                f"🥇 目标1：¥{s.target1}\n"
+                f"🔗 https://quote.eastmoney.com/unify/r/0.{s.code}\n"
+            )
         content = header + "\n".join(parts)
 
     try:

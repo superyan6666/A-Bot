@@ -1,66 +1,64 @@
-# 仅展示修改部分：优化内部超时控制
-# ... (前部代码保持一致)
+name: Intraday Right-Side Trading Bot
 
-def get_signals() -> tuple[list[Signal], set, int]:
-    now = datetime.now(TZ_BJS)
-    log.info('🚀 弹性加固型量化引擎启动...')
-    if not IS_MANUAL and not is_trading_time(now): return [], set(), 0
+on:
+  schedule:
+    # A股交易日期间，每隔 30 分钟运行一次
+    - cron: '*/30 1-3,5-7 * * 1-5'
+  workflow_dispatch:
+    inputs:
+      push_empty:
+        description: '是否在无信号时也推送状态报告？'
+        required: false
+        default: false
+        type: boolean
 
-    c_conf, pushed = Config(), load_pushed_state()
+permissions:
+  contents: write
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
     
-    # 【优化：缩短网络等待上限】
-    with ThreadPoolExecutor(max_workers=2) as ex:
-        f_spot, f_flow = ex.submit(fetch_spot), ex.submit(get_fund_flow_map)
-        try:
-            df_raw = f_spot.result(timeout=15) # 15秒必须拿到行情
-            flow_map = f_flow.result(timeout=10)
-        except FuturesTimeoutError:
-            log.error("❌ 核心数据获取超时，可能网络波动")
-            return [], pushed, 0
-
-    df_clean, m_ok, m_msg, idx_ret = extract_market_context(df_raw, c_conf)
-    log.info(f"📈 扫描全市场: {m_msg}")
-
-    # ... (初选过滤器逻辑)
-
-    log.info(f"✅ 初选捕获 {len(pool)} 只个股，执行深度特征工程...")
-
-    sec_strengths = fetch_sector_strength()
-    candidate_data = []
-    end_s, start_s = now.strftime('%Y%m%d'), (now - timedelta(days=450)).strftime('%Y%m%d')
+    # 【严谨性建议】：盘中监控对时间要求极高。
+    # 设置 4 分钟强行熔断，既能保证信号不过时，也能最大化节省 GitHub 免费时长。
+    timeout-minutes: 4
     
-    # 【优化：提高并行效率，严格控制单股抓取时间】
-    with ThreadPoolExecutor(max_workers=12) as ex:
-        futures = {ex.submit(fetch_hist, r[C.S_CODE], start_s, end_s): r for _, r in pool.iterrows()}
-        for f in as_completed(futures):
-            row = futures[f]
-            try:
-                # 每只股票的历史数据下载不能超过 5 秒，否则跳过
-                hist = f.result(timeout=5) 
-                result = process_stock(row, hist, now, m_ok, idx_ret, flow_map.get(row[C.S_CODE], 0.0))
-                if result:
-                    data, stop, risk = result
-                    # 极速获取板块信息 (设置 2s 超时)
-                    try:
-                        sector = fetch_stock_sector(row[C.S_CODE])
-                    except:
-                        sector = ""
-                    
-                    s_pct = sec_strengths.get(sector, 0.0)
-                    data.update({
-                        'sector': sector, 'sector_pct': s_pct, 
-                        'sector_ok': (s_pct > 1.0)
-                    })
-                    
-                    score, level, reas = apply_scoring(data)
-                    if score >= 60:
-                        # ... (封装 Signal 逻辑)
-                        candidate_data.append(Signal(...))
-                        pushed.add(row[C.S_CODE])
-            except Exception as e:
-                log.debug(f"分析跳过 {row[C.S_CODE]}: {e}")
+    steps:
+      # 【一致性修复 1】：升级至 v4，消除 Node 16 废弃警告，加快启动速度
+      - name: 检出代码
+        uses: actions/checkout@v4
 
-    candidate_data.sort(key=lambda x: x.score, reverse=True)
-    return candidate_data, pushed, len(pool)
+      - name: 搭建 Python 环境
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
 
-# ... (后续代码)
+      # 利用缓存跳过 C/C++ 库(如 numpy, pandas)的编译与下载，大幅提速
+      - name: 缓存 pip 依赖
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-quant-v2
+          restore-keys: |
+            ${{ runner.os }}-pip-quant-
+
+      # 【一致性修复 2】：必须追加 --upgrade 参数！
+      # 核心原理：让大型库(pandas/numpy)命中缓存极速安装，同时强迫 pip 检查并拉取最新版的 akshare，防止接口变动导致系统瘫痪。
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install --upgrade akshare pandas numpy requests pytz
+
+      - name: 启动监控引擎
+        env:
+          DINGTALK_WEBHOOK: ${{ secrets.DINGTALK_WEBHOOK }}
+          # 【一致性修复 3】：使用现代化的 inputs 上下文，逻辑运算更安全
+          PUSH_EMPTY_RESULT: ${{ inputs.push_empty || 'false' }}
+          PYTHONUNBUFFERED: "1"
+        run: python main.py
+
+      - name: 保存运行状态
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "[bot] sync state"
+          file_pattern: 'pushed_state.json'

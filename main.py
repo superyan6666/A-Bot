@@ -387,29 +387,30 @@ def fetch_sector_strength() -> dict:
     except: return {}
 
 def extract_market_context(df_raw: pd.DataFrame, c_conf: Config) -> tuple[pd.DataFrame, bool, str, float]:
-    """深度测算大盘多空、广度、连板情绪，输出建仓建议"""
-    if len(df_raw) < 1000: return pd.DataFrame(), False, "API 异常", 0.0
-    
-    market_ok, market_msg, index_ret = True, "", 0.0
+    """完全隔离异常的大盘测算：确保横截面报错时，指数照样计算！"""
+    market_ok, market_msg, index_ret = True, "获取大盘指数失败", 0.0
     try:
-        # 1. 指数核心计算
         idx_df = ak.stock_zh_index_daily_em(symbol='sh000001')
         cl = idx_df[C.I_CLOSE]
         ma20 = cl.rolling(20).mean().iloc[-1]
         pct = (cl.iloc[-1] - cl.iloc[-2]) / cl.iloc[-2] * 100
         market_ok = (cl.iloc[-1] > ma20)
         index_ret = ((cl.iloc[-1] / cl.iloc[-60]) - 1) * 100 if len(cl) >= 60 else 0.0
+        market_msg = f"上证指数: {cl.iloc[-1]:.2f} (今日 {pct:+.2f}%)，{'🟢 运行于 MA20 均线之上' if market_ok else '🔴 跌破 MA20 生命线'}\n"
+    except Exception as e:
+        log.warning(f"大盘基准获取失败: {e}")
 
-        # 2. 横截面情绪计算
+    # 如果抓到空数据或被反爬封锁
+    if len(df_raw) < 1000:
+        return pd.DataFrame(), market_ok, market_msg + "⚠️ 个股横截面数据获取失败，无法计算情绪指标。", index_ret
+
+    try:
         up_count = (df_raw[C.S_PCT] > 0).sum()
         down_count = (df_raw[C.S_PCT] < 0).sum()
-        zt_count = (df_raw[C.S_PCT] >= 9.0).sum() # 宽泛判定涨停
-        dt_count = (df_raw[C.S_PCT] <= -9.0).sum() # 宽泛判定跌停
-        
-        # 3. 两市实时总成交额 (亿)
+        zt_count = (df_raw[C.S_PCT] >= 9.0).sum()
+        dt_count = (df_raw[C.S_PCT] <= -9.0).sum()
         total_amt = df_raw[C.S_AMT].sum() / 1e8 
         
-        # 4. 根据市场广度出具智能操作建议
         breadth = up_count / (up_count + down_count) if (up_count + down_count) > 0 else 0.5
         advice = ""
         if market_ok and breadth >= 0.6:
@@ -421,14 +422,13 @@ def extract_market_context(df_raw: pd.DataFrame, c_conf: Config) -> tuple[pd.Dat
         else:
             advice = "🛡️ 弱势震荡市 (建议仓位 20%-40%)，亏钱效应蔓延，严格控制回撤与止损纪律。"
 
-        market_msg = (
-            f"大盘指数: {cl.iloc[-1]:.2f} (今日 {pct:+.2f}%)，{'🟢 运行于 MA20 均线之上' if market_ok else '🔴 跌破 MA20 生命线'}\n"
+        market_msg += (
             f"🌡️ 市场情绪: 上涨 {up_count} 家 / 下跌 {down_count} 家 (涨停 {zt_count} / 跌停 {dt_count})\n"
             f"💰 实时量能: 两市总成交额约 {total_amt:.0f} 亿元\n"
             f"💡 操盘策略: {advice}"
         )
     except Exception as e:
-        log.warning(f"宏观状态解析失败: {e}")
+        log.warning(f"横截面情绪计算异常: {e}")
 
     df = df_raw.dropna(subset=list(c_conf.REQUIRED_COLS))
     df = df[~df[C.S_NAME].str.contains('ST|退')]
@@ -442,16 +442,31 @@ def get_signals() -> tuple[list[Signal], set, int, str]:
     if not IS_MANUAL and not is_trading_time(now): return [], set(), 0, ""
 
     c_conf, pushed = Config(), load_pushed_state()
-    with ThreadPoolExecutor(max_workers=2) as ex:
-        f_spot, f_flow = ex.submit(fetch_spot), ex.submit(get_fund_flow_map)
-        df_raw, flow_map = f_spot.result(timeout=25), f_flow.result(timeout=15)
+    
+    # ── 【核心修复 1】：手动销毁阻塞的横截面请求 ──
+    ex1 = ThreadPoolExecutor(max_workers=2)
+    f_spot = ex1.submit(fetch_spot)
+    f_flow = ex1.submit(get_fund_flow_map)
+    df_raw = pd.DataFrame()
+    flow_map = {}
+    try:
+        df_raw = f_spot.result(timeout=40) # 允许40秒的最长等待
+        flow_map = f_flow.result(timeout=20)
+    except FuturesTimeoutError:
+        log.error("❌ 行情或资金流请求严重超时(>40s)，触发系统防卡死降级处理。")
+    except Exception as e:
+        log.error(f"❌ 横截面数据获取失败: {e}")
+    finally:
+        ex1.shutdown(wait=False, cancel_futures=True) # 绝不等待，立即释放死锁的线程！
 
     df_clean, m_ok, m_msg, idx_ret = extract_market_context(df_raw, c_conf)
     log.info(f"📈 扫描全市场宏观:\n{m_msg}")
     
-    # 纯大盘体检模式，直接返回空名单
     if run_mode == 'market_only':
-        log.info("🤖 开启纯大盘体检播报，跳过个股运算。")
+        log.info("🤖 纯大盘体检模式完成，跳过个股运算。")
+        return [], pushed, 0, m_msg
+
+    if df_clean.empty:
         return [], pushed, 0, m_msg
 
     mask = (df_clean[C.S_PCT] >= c_conf.MIN_PCT_CHG) & \
@@ -470,16 +485,26 @@ def get_signals() -> tuple[list[Signal], set, int, str]:
     candidate_data = []
     end_s, start_s = now.strftime('%Y%m%d'), (now - timedelta(days=450)).strftime('%Y%m%d')
     
-    with ThreadPoolExecutor(max_workers=10) as ex:
-        futures = {ex.submit(fetch_hist, r[C.S_CODE], start_s, end_s): r for _, r in pool.iterrows()}
-        for f in as_completed(futures):
+    # ── 【核心修复 2】：硬截断耗时超长的 K线池分析 ──
+    ex2 = ThreadPoolExecutor(max_workers=10)
+    futures = {ex2.submit(fetch_hist, r[C.S_CODE], start_s, end_s): r for _, r in pool.iterrows()}
+    
+    try:
+        # 整体任务限制：即使标的再多，最多只处理 90 秒，超出的个股直接截断放弃
+        for f in as_completed(futures, timeout=90):
             row = futures[f]
             try:
-                hist = f.result(timeout=8)
+                hist = f.result(timeout=5) # 单只股票处理不能卡死超过5秒
                 result = process_stock(row, hist, now, m_ok, idx_ret, flow_map.get(row[C.S_CODE], 0.0))
                 if result:
                     data, stop, risk = result
-                    sector = fetch_stock_sector(row[C.S_CODE])
+                    
+                    # 极速获取板块：防止该步骤卡死
+                    try:
+                        sector = fetch_stock_sector(row[C.S_CODE])
+                    except:
+                        sector = ""
+                        
                     s_pct = sec_strengths.get(sector, 0.0)
                     data.update({
                         'sector': sector, 'sector_pct': s_pct, 
@@ -501,7 +526,14 @@ def get_signals() -> tuple[list[Signal], set, int, str]:
                             sector=sector, sector_pct=s_pct
                         ))
                         pushed.add(row[C.S_CODE])
-            except: pass
+            except FuturesTimeoutError:
+                log.debug(f"⚠️ 跳过异常标的(单次请求超时): {row[C.S_CODE]}")
+            except Exception as e:
+                log.debug(f"⚠️ 分析失败: {e}")
+    except FuturesTimeoutError:
+        log.warning("⏳ 个股深度运算触发 90 秒总体强制熔断，已停止分析余下标的保护时间分配。")
+    finally:
+        ex2.shutdown(wait=False, cancel_futures=True) # 无情杀掉后台还在等数据的线程
 
     candidate_data.sort(key=lambda x: x.score, reverse=True)
     return candidate_data, pushed, len(pool), m_msg
@@ -538,8 +570,7 @@ def send_dingtalk(signals: list[Signal], total: int, market_msg: str) -> None:
                 f"💰 现价：¥{s.price} ({s.pct_chg})\n"
                 f"--- 核心逻辑 ---\n{s.reasons}\n"
                 f"--- 资金管理 ---\n{s.position_advice}\n"
-                f"🛑 止损：¥{s.stop_loss}\n"
-                f"🥇 目标1：¥{s.target1}\n"
+                f"🛑 止损：¥{s.stop_loss} | 🥇 目标：¥{s.target1}\n"
                 f"🔗 https://quote.eastmoney.com/unify/r/0.{s.code}\n"
             )
         content = header + "\n".join(parts)

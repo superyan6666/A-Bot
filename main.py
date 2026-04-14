@@ -97,11 +97,12 @@ class EnvParser:
 
 @dataclass(frozen=True)
 class Config:
+    # 策略初筛阈值：兼顾弹性与起爆逻辑
     MIN_CAP: float       = field(default_factory=lambda: EnvParser.get_float('MIN_CAP', 20e8))
     MAX_CAP: float       = field(default_factory=lambda: EnvParser.get_float('MAX_CAP', 500e8))
     MIN_PE: float        = field(default_factory=lambda: EnvParser.get_float('MIN_PE', 0))
     MAX_PE: float        = field(default_factory=lambda: EnvParser.get_float('MAX_PE', 100))
-    MIN_TURNOVER: float  = field(default_factory=lambda: EnvParser.get_float('MIN_TURNOVER', 2.0))
+    MIN_TURNOVER: float  = field(default_factory=lambda: EnvParser.get_float('MIN_TURNOVER', 1.8))
     MIN_PCT_CHG: float   = field(default_factory=lambda: EnvParser.get_float('MIN_PCT_CHG', 3.5))
     MIN_VOL_RATIO: float = field(default_factory=lambda: EnvParser.get_float('MIN_VOL_RATIO', 1.0))
     MAX_VOL_RATIO: float = field(default_factory=lambda: EnvParser.get_float('MAX_VOL_RATIO', 10.0))
@@ -179,10 +180,7 @@ def retry(times=3, delay=2, exceptions=(RequestException, ConnectionError, Value
 def fetch_hist(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
     df = ak.stock_zh_a_hist(symbol=code, period='daily', start_date=start, end_date=end, adjust='qfq')
     if df is None or df.empty: raise ValueError('history_empty')
-    c_conf = Config()
-    missing = [c for c in c_conf.HIST_COLS if c not in df.columns]
-    if missing: raise ValueError(f'missing_cols: {missing}')
-    return df[list(c_conf.HIST_COLS)].copy()
+    return df[list(Config.HIST_COLS)].copy()
 
 @retry(times=3, delay=2)
 def fetch_spot() -> pd.DataFrame:
@@ -204,7 +202,7 @@ def get_fund_flow_map() -> dict:
         return {}
 
 
-# ── 5. 指标与评分引擎 (Core Logic) ───────────────────────────────────────────
+# ── 5. A 股指标引擎 (AShare Indicator Engine) ──────────────────────────────────
 class AShareTechnicals:
     def __init__(self, df: pd.DataFrame):
         self.df = df.copy()
@@ -242,37 +240,46 @@ class AShareTechnicals:
         if rng <= 0: return None
         
         price_pct = (today[C.H_CLOSE] - min_1y) / rng
-        if price_pct > 0.85: return None
+        if price_pct > 0.88: return None # 极高位规避
 
-        # 核心多头趋势 + 通道突破
-        if not (today[C.H_CLOSE] >= today['MA60'] and today['DIF'] > -0.15): return None
-        if not (today[C.H_CLOSE] > today['上'] and today[C.H_VOL] > today['MA20_V'] * 1.2): return None
+        # 核心筛选：必须站上 60 日均线且出现 通道突破
+        if not (today[C.H_CLOSE] >= today['MA60'] and today['DIF'] > -0.2): return None
+        if not (today[C.H_CLOSE] > today['上'] and today[C.H_VOL] > today['MA20_V'] * 1.15): return None
 
-        # 筹码峰算法
-        has_chip_break = False
+        # 筹码峰
         rec120 = df.iloc[-121:-1]
+        has_chip_break = False
         if len(rec120) > 20 and rec120[C.H_VOL].sum() > 0:
             counts, edges = np.histogram(rec120[C.H_CLOSE].values, bins=20, weights=rec120[C.H_VOL].values)
             poc = (edges[counts.argmax()] + edges[counts.argmax() + 1]) / 2
             has_chip_break = bool((today['REF_C'] <= poc) and (today[C.H_CLOSE] > poc))
 
-        zt_mask = df['PCT_CHG'].iloc[-61:-1] >= 9.5
-        
+        # 价格连红判定
+        red_days = 0
+        for i in range(1, 4):
+            if df[C.H_CLOSE].iloc[-i] > df[C.H_OPEN].iloc[-i]: red_days += 1
+            else: break
+
         return {
             'price_pct': price_pct, 'max_1y': max_1y, 'adx': float(today['ADX']),
             'bull_rank': (today['MA20'] > today['MA60']),
-            'has_zt': bool(zt_mask.any()), 'has_consecutive_zt': bool((zt_mask.rolling(2).sum() >= 2).any()),
+            'has_zt': bool((df['PCT_CHG'].iloc[-61:-1] >= 9.5).any()),
+            'has_consecutive_zt': bool(((df['PCT_CHG'].iloc[-61:-1] >= 9.5).rolling(2).sum() >= 2).any()),
             'vcp_amp': (df[C.H_HIGH].iloc[-11:-1].max() - df[C.H_LOW].iloc[-11:-1].min()) / df[C.H_LOW].iloc[-11:-1].min() if df[C.H_LOW].iloc[-11:-1].min() > 0 else 0.5,
             'upper_shadow_pct': ((today[C.H_HIGH] - today[C.H_CLOSE]) / (today[C.H_CLOSE]-today[C.H_OPEN])*100) if (today[C.H_CLOSE]-today[C.H_OPEN]) > 0 else 0.0,
             'has_obv_break': bool(df['OBV'].iloc[-1] > df['OBV'].iloc[-21:-1].max()),
             'has_pullback': bool(self.two_days_ago is not None and self.two_days_ago[C.H_CLOSE] > self.two_days_ago['上'] and yest[C.H_CLOSE] <= yest['上'] and yest[C.H_VOL] < yest['MA5_V'] and yest[C.H_CLOSE] > yest['MA20']),
             'has_chip_break': has_chip_break,
+            'dist_ma20': (today[C.H_CLOSE] / today['MA20'] - 1) * 100,
+            'red_days': red_days,
             'ma10_val': float(today['MA10']), 'ma20_val': float(today['MA20']), 'atr_val': float(today['ATR']),
             'low_val': float(today[C.H_LOW]), 'recent_20_low': float(df[C.H_LOW].iloc[-20:].min()),
             'boll_lower': float(today['MA20'] - 2 * df[C.H_CLOSE].iloc[-20:].dropna().std()) if len(df[C.H_CLOSE].iloc[-20:].dropna()) >= 2 else np.nan,
             'close_60d_ago': float(df[C.H_CLOSE].iloc[-60]) if len(df) >= 60 else 0.0,
         }
 
+
+# ── 5. 打分引擎 (Enhanced Scoring Engine) ───────────────────────────────────
 @dataclass
 class Factor:
     condition: Callable[[dict], bool]
@@ -283,21 +290,33 @@ class Factor:
 def apply_scoring(data: dict) -> tuple[int, str, str]:
     adx = data['adx']
     tw, rw = (1.4, 0.7) if adx > 25 else (0.8, 1.4) if adx < 15 else (1.0, 1.0)
-    meta = f"🧭 ADX={adx:.1f} {'【强趋势模式】' if adx > 25 else '【低位转强模式】' if adx < 15 else ''}"
+    meta = f"🧭 ADX={adx:.1f} {'【主升趋势】' if adx > 25 else '【低位反转】' if adx < 15 else ''}"
 
     factors = [
+        # 1. 结构与位置
         Factor(lambda d: d['price_pct'] < 0.25, 15, rw, "🟢 处于波段底部起涨区(分位{price_pct_pct:.1f}%)"),
         Factor(lambda d: 0.25 <= d['price_pct'] < 0.55, 10, 1.0, "🟢 处于主升拉升区(分位{price_pct_pct:.1f}%)"),
-        Factor(lambda d: d['bull_rank'], 10, 1.0, "📈 均线确认多头强势趋势"),
-        Factor(lambda d: d['has_zt'], 15, 1.0, "🔥 历史涨停基因活跃(股性佳)"),
-        Factor(lambda d: d['has_consecutive_zt'], 12, 1.0, "🔥🔥 连板妖股潜质(市场高度辨识度)"),
+        Factor(lambda d: d['bull_rank'], 10, 1.0, "📈 均线多头排列确认趋势"),
+        
+        # 2. 动能与活跃度
+        Factor(lambda d: d['has_zt'], 15, 1.0, "🔥 涨停基因活跃(股性佳)"),
+        Factor(lambda d: d['has_consecutive_zt'], 12, 1.0, "🔥🔥 连板妖股潜质"),
         Factor(lambda d: d['vol_ratio'] >= 1.8, 10, 1.0, "🔵 显著放量突破({vol_ratio:.1f}x)"),
-        Factor(lambda d: d['has_chip_break'], 15, tw, "🏔️ 强力跨越筹码密集峰(解套动能释放)"),
-        Factor(lambda d: d['vcp_amp'] < 0.12, 8, 1.0, "🟣 VCP收缩形态(振幅{vcp_amp_pct:.1f}%)蓄势充分"),
+        Factor(lambda d: d['red_days'] >= 3, 8, 1.0, "🔴 连收{red_days}日红阳，动能稳健"),
+        
+        # 3. 筹码与量能
+        Factor(lambda d: d['has_chip_break'], 15, tw, "🏔️ 强力跨越筹码密集峰"),
+        Factor(lambda d: d['vcp_amp'] < 0.12, 10, 1.0, "🟣 VCP收缩形态(振幅{vcp_amp_pct:.1f}%)蓄势充分"),
         Factor(lambda d: d['has_obv_break'], 10, tw, "💸 OBV量能创近期新高"),
-        Factor(lambda d: d['has_pullback'], 15, 1.0, "🪃 符合缩量回踩形态确认"),
-        Factor(lambda d: d['rs_rating'] > 15, 10, tw, "🏆 相对强度优势(超额收益 {rs_rating:.1f}%)"),
+        Factor(lambda d: d['has_pullback'], 15, 1.0, "🪃 符合老鸭头回踩形态"),
         Factor(lambda d: d['has_fund_inflow'], 12, tw, "💰 主力抢筹({fund_flow_w:.0f}万)状态确认"),
+        
+        # 4. 环境加持
+        Factor(lambda d: d.get('sector_ok', False), 15, 1.0, "🌟 板块共振：所属{sector}涨幅({sector_pct:+.2f}%)居前"),
+        
+        # 5. 【排雷减分项】
+        Factor(lambda d: d['upper_shadow_pct'] > 18, -15, 1.0, "⚠️ 上影线抛压严重({upper_shadow_pct:.1f}%)，警惕回落"),
+        Factor(lambda d: d['dist_ma20'] > 18, -20, 1.0, "🚫 偏离均线过远(乖离率{dist_ma20:.1f}%)，追高风险大"),
     ]
 
     score, reasons = 40, [meta] if meta else []
@@ -309,8 +328,8 @@ def apply_scoring(data: dict) -> tuple[int, str, str]:
             score += int(f.points * f.weight)
             reasons.append(f.template.format(**data))
 
-    score = min(score, 100)
-    level = '⭐⭐⭐⭐⭐ [S级极品]' if score >= 82 else '⭐⭐⭐⭐ [A级强势]' if score >= 72 else '⭐⭐⭐ [B级标准]'
+    score = max(0, min(score, 100)) # 限制范围 0-100
+    level = '⭐⭐⭐⭐⭐ [S级极品]' if score >= 82 else '⭐⭐⭐⭐ [A级强势]' if score >= 70 else '⭐⭐⭐ [B级标准]'
     return score, level, '\n'.join(reasons)
 
 
@@ -343,33 +362,20 @@ def process_stock(row: pd.Series, raw_hist: pd.DataFrame, now: datetime, market_
     data['has_fund_inflow'] = flow > max(1e7, float(row.get(C.S_MCAP, 0)) * 0.001)
     data['rs_rating'] = ((row[C.S_PRICE] / data['close_60d_ago'] - 1) * 100 - index_ret) if data['close_60d_ago'] > 0 else 0
     
-    score, level, reas = apply_scoring(data)
-    if score < 60: return None 
-
-    # 风险测算
+    # 风控核算 (提前进行风控测算，过滤风险过大标的)
     supports = [data['ma20_val'], data['recent_20_low'], data['boll_lower']]
     valid_supports = [s for s in supports if pd.notna(s) and s < row[C.S_PRICE]]
-    stop = max(valid_supports + [row[C.S_PRICE] * 0.925]) * 0.992
+    stop = max(valid_supports + [row[C.S_PRICE] * 0.92]) * 0.993 # 综合止损位
     risk_pct = ((row[C.S_PRICE] - stop) / row[C.S_PRICE]) * 100 if row[C.S_PRICE] > 0 else 99
     
-    if risk_pct > 8.5: return None
+    if risk_pct > 8.5: return None 
 
-    pos = (30 if score >= 82 else 20 if score >= 72 else 10)
-    if not market_ok: pos //= 2
-
-    return Signal(
-        code=row[C.S_CODE], name=row[C.S_NAME], price=row[C.S_PRICE],
-        pct_chg=f"{row[C.S_PCT]}%", score=score, level=level,
-        position_advice=f"⚖️ 建议仓位 {pos}% (风险系数 {risk_pct:.1f}%)",
-        trigger_time=now.strftime('%H:%M'), reasons=reas,
-        stop_loss=round(stop, 2), target1=round(row[C.S_PRICE]*(1+risk_pct*2.2/100), 2),
-        target2=round(data['max_1y'], 2), ma10=round(data['ma10_val'], 2)
-    )
+    # 评分逻辑（由于后续 get_signals 还要注入板块，此处评分是初稿，最终在 Controller 完善）
+    return (data, stop, risk_pct) # 返回元组供 Controller 进一步处理
 
 
-# ── 7. 控制器与板块增强 (Orchestrator & Sector Bridge) ──────────────────────────
+# ── 7. 控制器与板块增强 (Orchestrator) ──────────────────────────────────────────
 def fetch_stock_sector(code: str) -> str:
-    """【通路修复】：补充获取个股所属行业信息"""
     try:
         df = ak.stock_individual_info_em(symbol=code)
         v = df[df[C.INFO_ITEM] == '行业'][C.INFO_VAL].values[0]
@@ -377,21 +383,20 @@ def fetch_stock_sector(code: str) -> str:
     except: return ""
 
 def fetch_sector_strength() -> dict:
-    """【通路修复】：获取全行业今日涨跌幅，用于强度背书"""
     try:
         df = ak.stock_board_industry_spot_em()
         return dict(zip(df[C.B_NAME], df[C.B_PCT]))
     except: return {}
 
 def extract_market_context(df_raw: pd.DataFrame, c_conf: Config) -> tuple[pd.DataFrame, bool, str, float]:
-    if len(df_raw) < 1000: return pd.DataFrame(), False, "API 响应异常", 0.0
+    if len(df_raw) < 1000: return pd.DataFrame(), False, "API 异常", 0.0
     market_ok, market_msg, index_ret = True, "", 0.0
     try:
         idx_df = ak.stock_zh_index_daily_em(symbol='sh000001')
         cl = idx_df[C.I_CLOSE]
         ma20 = cl.rolling(20).mean().iloc[-1]
         market_ok = (cl.iloc[-1] > ma20)
-        market_msg = f"上证 {cl.iloc[-1]:.2f} {'(做多窗口)' if market_ok else '(防守窗口)'}"
+        market_msg = f"上证 {cl.iloc[-1]:.2f} {'(多头状态)' if market_ok else '(防守状态)'}"
         index_ret = ((cl.iloc[-1] / cl.iloc[-60]) - 1) * 100 if len(cl) >= 60 else 0.0
     except: pass
     df = df_raw.dropna(subset=list(c_conf.REQUIRED_COLS))
@@ -400,7 +405,7 @@ def extract_market_context(df_raw: pd.DataFrame, c_conf: Config) -> tuple[pd.Dat
 
 def get_signals() -> tuple[list[Signal], set, int]:
     now = datetime.now(TZ_BJS)
-    log.info('🚀 A股弹性平衡量化引擎启动...')
+    log.info('🚀 弹性加固型量化引擎启动...')
     if not IS_MANUAL and not is_trading_time(now): return [], set(), 0
 
     c_conf, pushed = Config(), load_pushed_state()
@@ -409,7 +414,7 @@ def get_signals() -> tuple[list[Signal], set, int]:
         df_raw, flow_map = f_spot.result(timeout=25), f_flow.result(timeout=15)
 
     df_clean, m_ok, m_msg, idx_ret = extract_market_context(df_raw, c_conf)
-    log.info(f"📈 扫描中: {m_msg}")
+    log.info(f"📈 扫描全市场: {m_msg}")
 
     mask = (df_clean[C.S_PCT] >= c_conf.MIN_PCT_CHG) & \
            (df_clean[C.S_MCAP].between(c_conf.MIN_CAP, c_conf.MAX_CAP)) & \
@@ -417,44 +422,61 @@ def get_signals() -> tuple[list[Signal], set, int]:
     
     if C.S_VR in df_clean.columns:
         t_val = now.hour * 100 + now.minute
-        vr_max = 9.5 if t_val <= 1030 else 6.5
+        vr_max = 9.5 if t_val <= 1030 else 6.0
         mask &= df_clean[C.S_VR].between(c_conf.MIN_VOL_RATIO, vr_max)
 
     pool = df_clean[mask].pipe(lambda d: d[~d[C.S_CODE].isin(pushed)]).copy()
     if pool.empty: return [], pushed, 0
 
-    log.info(f"✅ 初选捕获 {len(pool)} 只个股，正在并行深度计算指标...")
+    log.info(f"✅ 初选捕获 {len(pool)} 只个股，执行深度特征工程...")
 
-    initial_signals = []
+    sec_strengths = fetch_sector_strength()
+    candidate_data = []
     end_s, start_s = now.strftime('%Y%m%d'), (now - timedelta(days=450)).strftime('%Y%m%d')
+    
     with ThreadPoolExecutor(max_workers=10) as ex:
         futures = {ex.submit(fetch_hist, r[C.S_CODE], start_s, end_s): r for _, r in pool.iterrows()}
         for f in as_completed(futures):
             row = futures[f]
             try:
                 hist = f.result(timeout=8)
-                sig = process_stock(row, hist, now, m_ok, idx_ret, flow_map.get(row[C.S_CODE], 0.0))
-                if sig: initial_signals.append(sig)
-            except Exception as e:
-                log.debug(f"流水线抛弃 {row[C.S_CODE]}: {e}")
+                result = process_stock(row, hist, now, m_ok, idx_ret, flow_map.get(row[C.S_CODE], 0.0))
+                if result:
+                    data, stop, risk = result
+                    # 后置增强：注入板块信息进行评分加权
+                    sector = fetch_stock_sector(row[C.S_CODE])
+                    s_pct = sec_strengths.get(sector, 0.0)
+                    data.update({
+                        'sector': sector, 'sector_pct': s_pct, 
+                        'sector_ok': (s_pct > 1.0) # 板块今日涨幅大于 1% 视为共振
+                    })
+                    
+                    score, level, reas = apply_scoring(data)
+                    if score >= 60:
+                        pos_pos = (30 if score >= 82 else 20 if score >= 70 else 10)
+                        if not m_ok: pos_pos //= 2
+                        
+                        candidate_data.append(Signal(
+                            code=row[C.S_CODE], name=row[C.S_NAME], price=row[C.S_PRICE],
+                            pct_chg=f"{row[C.S_PCT]}%", score=score, level=level,
+                            position_advice=f"⚖️ 建议仓位 {pos_pos}% (风险系数 {risk:.1f}%)",
+                            trigger_time=now.strftime('%H:%M'), reasons=reas,
+                            stop_loss=round(stop, 2), target1=round(row[C.S_PRICE]*(1+risk*2.2/100), 2),
+                            target2=round(data['max_1y'], 2), ma10=round(data['ma10_val'], 2),
+                            sector=sector, sector_pct=s_pct
+                        ))
+                        pushed.add(row[C.S_CODE])
+            except: pass
 
-    # 【通路接龙】：后置填充板块强度，只针对通过筛选的极少数精英
-    if initial_signals:
-        sec_strengths = fetch_sector_strength()
-        for s in initial_signals:
-            s.sector = fetch_stock_sector(s.code)
-            s.sector_pct = sec_strengths.get(s.sector, 0.0)
-            pushed.add(s.code) # 正式加入已推送名单
-
-    initial_signals.sort(key=lambda x: x.score, reverse=True)
-    return initial_signals, pushed, len(pool)
+    candidate_data.sort(key=lambda x: x.score, reverse=True)
+    return candidate_data, pushed, len(pool)
 
 
 def send_dingtalk(signals: list[Signal], total: int) -> None:
     webhook = os.environ.get('DINGTALK_WEBHOOK')
     if not webhook: return
     now_str = datetime.now(TZ_BJS).strftime('%Y-%m-%d %H:%M')
-    header = f"🤖 AI 量化执行纪律单 (弹性增强版) {now_str}\n\n"
+    header = f"🤖 AI 量化执行纪律单 {now_str}\n\n"
     if not signals:
         if not (IS_MANUAL and PUSH_EMPTY): return
         content = f"{header}✅ 深度体检 {total} 只标的，未发现极致信号，系统待机中。"
@@ -471,6 +493,7 @@ def send_dingtalk(signals: list[Signal], total: int) -> None:
                 f"--- 资金管理 ---\n{s.position_advice}\n"
                 f"🛑 止损：¥{s.stop_loss}\n"
                 f"🥇 目标1：¥{s.target1}\n"
+                f"🚀 移动止盈：MA10(≈¥{s.ma10})\n"
                 f"🔗 https://quote.eastmoney.com/unify/r/0.{s.code}\n"
             )
         content = header + "\n".join(parts)

@@ -6,7 +6,6 @@ on:
     - cron: '*/30 1-3,5-7 * * 1-5'
   workflow_dispatch:
     inputs:
-      # 增加功能测试下拉菜单
       run_mode:
         description: '运行模式 (全量量化扫描 / 仅大盘体检播报 / 仅测试连通性)'
         required: true
@@ -19,7 +18,7 @@ on:
       push_empty:
         description: '是否在无信号时也推送大盘状态报告？'
         required: false
-        default: true  # 【修改】：默认开启大盘播报，即便没有抓到股票也能看到上证指数状态
+        default: true
         type: boolean
 
 permissions:
@@ -29,21 +28,20 @@ jobs:
   run-bot:
     runs-on: ubuntu-latest
     
-    # 【严谨性建议】：盘中监控对时间要求极高。
-    # 设置 4 分钟强行熔断，既能保证信号不过时，也能最大化节省 GitHub 免费时长。
-    timeout-minutes: 4
+    # 强行熔断时间：5分钟。给 Python 内部 40s+90s 的优雅降级留下充分缓冲时间
+    timeout-minutes: 5
     
     steps:
-      # 【一致性修复 1】：升级至 v4，消除 Node 16 废弃警告，加快启动速度
       - name: 检出代码
         uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: 搭建 Python 环境
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
 
-      # 利用缓存跳过 C/C++ 库(如 numpy, pandas)的编译与下载，大幅提速
       - name: 缓存 pip 依赖
         uses: actions/cache@v4
         with:
@@ -52,8 +50,6 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-pip-quant-
 
-      # 【一致性修复 2】：必须追加 --upgrade 参数！
-      # 核心原理：让大型库(pandas/numpy)命中缓存极速安装，同时强迫 pip 检查并拉取最新版的 akshare，防止接口变动导致系统瘫痪。
       - name: 安装依赖
         run: |
           python -m pip install --upgrade pip
@@ -62,7 +58,6 @@ jobs:
       - name: 启动监控引擎 / 测试连通性
         env:
           DINGTALK_WEBHOOK: ${{ secrets.DINGTALK_WEBHOOK }}
-          # 【逻辑注入】：让定时任务默认把 push_empty 视为 true，从而激活大盘播报
           PUSH_EMPTY_RESULT: ${{ inputs.push_empty || 'true' }} 
           RUN_MODE: ${{ inputs.run_mode || 'normal' }}
           PYTHONUNBUFFERED: "1"
@@ -89,9 +84,9 @@ jobs:
           fi
 
       - name: 保存运行状态
-        # 测试连通性和纯大盘播报模式下，不应该产生 Git 历史污染
         if: ${{ inputs.run_mode != 'test_conn' && inputs.run_mode != 'market_only' }} 
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          commit_message: "[bot] sync state"
+          commit_message: "[bot] 更新今日监控推送名单"
           file_pattern: 'pushed_state.json'
+          commit_options: '--no-verify --signoff'

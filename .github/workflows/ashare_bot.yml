@@ -58,10 +58,8 @@ jobs:
       - name: 启动监控引擎 / 测试连通性
         env:
           DINGTALK_WEBHOOK: ${{ secrets.DINGTALK_WEBHOOK }}
-          # 【错误修复 1】：精准拦截布尔类型的 false，绕过假值求值陷阱
           PUSH_EMPTY_RESULT: ${{ inputs.push_empty == false && 'false' || 'true' }} 
           RUN_MODE: ${{ inputs.run_mode || 'normal' }}
-          # 【错误修复 2】：强制输出编码为 UTF-8，彻底杜绝 Emoji 导致系统宕机
           PYTHONIOENCODING: "utf-8"
           PYTHONUNBUFFERED: "1"
         run: |
@@ -87,8 +85,7 @@ jobs:
           fi
 
       - name: 保存运行状态
-        # 【错误修复 3】：显式匹配触发源，保证定时任务(schedule)或普通模式(normal)绝对执行保存
-        if: ${{ github.event_name == 'schedule' || inputs.run_mode == 'normal' }} 
+        if: ${{ github.event_name == 'schedule' || inputs.run_mode == 'normal' }}
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
           commit_message: "[bot] 更新今日监控推送名单"

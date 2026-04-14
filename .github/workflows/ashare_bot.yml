@@ -8,17 +8,18 @@ on:
     inputs:
       # 增加功能测试下拉菜单
       run_mode:
-        description: '运行模式 (执行全量扫描 / 仅测试连通性)'
+        description: '运行模式 (全量量化扫描 / 仅大盘体检播报 / 仅测试连通性)'
         required: true
         default: 'normal'
         type: choice
         options:
           - normal
+          - market_only
           - test_conn
       push_empty:
-        description: '是否在无信号时也推送状态报告？'
+        description: '是否在无信号时也推送大盘状态报告？'
         required: false
-        default: false
+        default: true  # 【修改】：默认开启大盘播报，即便没有抓到股票也能看到上证指数状态
         type: boolean
 
 permissions:
@@ -61,8 +62,8 @@ jobs:
       - name: 启动监控引擎 / 测试连通性
         env:
           DINGTALK_WEBHOOK: ${{ secrets.DINGTALK_WEBHOOK }}
-          # 【一致性修复 3】：使用现代化的 inputs 上下文，逻辑运算更安全
-          PUSH_EMPTY_RESULT: ${{ inputs.push_empty || 'false' }}
+          # 【逻辑注入】：让定时任务默认把 push_empty 视为 true，从而激活大盘播报
+          PUSH_EMPTY_RESULT: ${{ inputs.push_empty || 'true' }} 
           RUN_MODE: ${{ inputs.run_mode || 'normal' }}
           PYTHONUNBUFFERED: "1"
         run: |
@@ -79,13 +80,17 @@ jobs:
           res = requests.post(webhook, json={'msgtype': 'text', 'text': {'content': msg}}, timeout=10)
           print('✅ 推送结果:', res.text)
           "
+          elif [ "$RUN_MODE" == "market_only" ]; then
+            echo "📊 检测到大盘体检模式，开始扫描宏观资金与情绪指标..."
+            python main.py
           else
             echo "🚀 执行全量 A 股量化扫描..."
             python main.py
           fi
 
       - name: 保存运行状态
-        if: ${{ inputs.run_mode != 'test_conn' }} # 测试模式下不需要提交运行状态
+        # 测试连通性和纯大盘播报模式下，不应该产生 Git 历史污染
+        if: ${{ inputs.run_mode != 'test_conn' && inputs.run_mode != 'market_only' }} 
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
           commit_message: "[bot] sync state"

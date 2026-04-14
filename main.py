@@ -23,6 +23,9 @@ IS_MANUAL    = os.environ.get('GITHUB_EVENT_NAME') == 'workflow_dispatch'
 IS_CI        = os.environ.get('GITHUB_ACTIONS') == 'true'
 PUSH_EMPTY   = os.environ.get('PUSH_EMPTY_RESULT', 'true').lower() in ('true', '1', 'yes')
 
+# 【核心防死锁修复】：强制要求所有隐式网络请求最多 15 秒超时，避免后台线程卡死阻碍 Python 进程退出
+socket.setdefaulttimeout(15.0)
+
 logging.basicConfig(
     level=getattr(logging, os.environ.get('LOG_LEVEL', 'INFO').upper(), logging.INFO),
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -160,7 +163,7 @@ class MathUtils:
 # ── 4. 数据拉取模块 ────────────────────────────────────────────────────────────
 import akshare as ak
 
-def retry(times=3, delay=2, exceptions=(RequestException, ConnectionError, ValueError, pd.errors.EmptyDataError)):
+def retry(times=3, delay=2, exceptions=(RequestException, ConnectionError, ValueError, pd.errors.EmptyDataError, socket.timeout)):
     def decorator(fn):
         @wraps(fn)
         def wrapper(*args, **kwargs):
@@ -387,22 +390,98 @@ def fetch_sector_strength() -> dict:
     except: return {}
 
 def extract_market_context(df_raw: pd.DataFrame, c_conf: Config) -> tuple[pd.DataFrame, bool, str, float]:
-    """完全隔离异常的大盘测算：确保横截面报错时，指数照样计算！"""
+    """深度解析大盘技术面，复用个股高阶因子进行大盘解盘"""
     market_ok, market_msg, index_ret = True, "获取大盘指数失败", 0.0
     try:
         idx_df = ak.stock_zh_index_daily_em(symbol='sh000001')
         cl = idx_df[C.I_CLOSE]
+        op = idx_df['open']
+        hi = idx_df['high']
+        lo = idx_df['low']
+        vol = idx_df['volume']
+        
+        # 基础技术形态计算
+        ma10 = cl.rolling(10).mean().iloc[-1]
         ma20 = cl.rolling(20).mean().iloc[-1]
+        ma60 = cl.rolling(60).mean().iloc[-1]
+        vol_ma5 = vol.rolling(5).mean().iloc[-1]
+        vol_ma20 = vol.rolling(20).mean().iloc[-1]
+        
+        # MACD计算
+        ema12 = cl.ewm(span=12, adjust=False).mean()
+        ema26 = cl.ewm(span=26, adjust=False).mean()
+        dif = (ema12 - ema26).iloc[-1]
+        dea = (ema12 - ema26).ewm(span=9, adjust=False).mean().iloc[-1]
+        
         pct = (cl.iloc[-1] - cl.iloc[-2]) / cl.iloc[-2] * 100
         market_ok = (cl.iloc[-1] > ma20)
         index_ret = ((cl.iloc[-1] / cl.iloc[-60]) - 1) * 100 if len(cl) >= 60 else 0.0
-        market_msg = f"上证指数: {cl.iloc[-1]:.2f} (今日 {pct:+.2f}%)，{'🟢 运行于 MA20 均线之上' if market_ok else '🔴 跌破 MA20 生命线'}\n"
+        
+        recent_low = cl.iloc[-20:].min()
+        recent_high = cl.iloc[-20:].max()
+
+        trend_status = "多头" if ma20 > ma60 else "空头"
+        macd_status = "金叉向好" if dif > dea else "死叉承压"
+        vol_status = "放量" if vol.iloc[-1] > vol_ma5 else "缩量"
+
+        # ─── 复用个股因子进行大盘深度解盘 (AI Insights) ───
+        ai_insights = []
+        if len(idx_df) >= 250:
+            today_cl, today_op, today_lo, today_hi, today_vol = cl.iloc[-1], op.iloc[-1], lo.iloc[-1], hi.iloc[-1], vol.iloc[-1]
+            
+            # 1. 结构位置 (1年分位)
+            min_1y, max_1y = lo.iloc[-250:].min(), hi.iloc[-250:].max()
+            price_pct = (today_cl - min_1y) / (max_1y - min_1y) if max_1y > min_1y else 0.5
+            if price_pct < 0.15:
+                ai_insights.append("🟢 【冰点区】大盘处于近一年绝对低位(分位<15%)，系统性风险已充分释放，长线胜率极高。")
+            elif price_pct > 0.85:
+                ai_insights.append("⚠️ 【高位区】大盘处于近一年高位(分位>85%)，积累获利盘较多，警惕系统性抛压。")
+
+            # 2. 均线粘合 (变盘先兆：指数的标准严于个股，误差1.5%即视为高度粘合)
+            if (abs(ma10 - ma20) / ma20 < 0.015) and (abs(ma20 - ma60) / ma60 < 0.025):
+                ai_insights.append("🌪️ 【面临变盘】短中长期均线高度密集粘合，大盘即将选择重大方向！")
+
+            # 3. 筹码峰突破 (解套抛压判定)
+            rec120_cl, rec120_vol = cl.iloc[-121:-1].values, vol.iloc[-121:-1].values
+            counts, edges = np.histogram(rec120_cl, bins=20, weights=rec120_vol)
+            poc = (edges[counts.argmax()] + edges[counts.argmax() + 1]) / 2
+            if (cl.iloc[-2] <= poc) and (today_cl > poc):
+                ai_insights.append("🏔️ 【跨越壁垒】指数强势跨越近半年核心筹码密集峰，上方套牢盘抛压大幅减轻。")
+
+            # 4. K线极限形态 (探底神针 / 避雷针)
+            body = abs(today_cl - today_op)
+            lower_shadow = (min(today_op, today_cl) - today_lo) / today_op * 100
+            upper_shadow_pct = ((today_hi - max(today_op, today_cl)) / body * 100) if body > 0 else 0
+            
+            if lower_shadow > 0.8: # 指数探底 0.8% 已经代表极强护盘
+                ai_insights.append("📌 【探底神针】盘中出现较长下影线，神秘资金护盘/场外资金承接极强。")
+            elif upper_shadow_pct > 200:
+                ai_insights.append("🚫 【抛压沉重】冲高回落留下长上影线(超实体2倍)，短期抛压极重，警惕诱多。")
+
+            # 5. 极端量能 (地量见地价 / 增量突破)
+            if vol.iloc[-2] < vol_ma20 * 0.65:
+                ai_insights.append("🧊 【地量洗盘】昨日呈现极端地量，场内恐慌抛压接近枯竭，关注今日上攻试探。")
+            elif today_vol > vol_ma20 * 1.3 and today_cl > today_op:
+                ai_insights.append("🔥 【增量入场】指数呈现显著放量阳线，增量资金进场特征明显，行情由存量转增量。")
+
+        insights_str = "\n   • ".join(ai_insights) if ai_insights else "市场处于常规推演运行中，暂无极端形态信号。"
+
+        market_msg = (
+            f"🎯 **上证指数**: {cl.iloc[-1]:.2f} (今日 {pct:+.2f}%)\n"
+            f"📈 **技术面概况**:\n"
+            f"   • 趋势: {'🟢 站上MA20生命线' if market_ok else '🔴 跌破MA20生命线'}，大级别呈{trend_status}。\n"
+            f"   • 动能: MACD{macd_status}，短期呈现{vol_status}{'上涨' if pct > 0 else '调整'}。\n"
+            f"   • 空间: 近期支撑 {recent_low:.0f} 点 | 压力 {recent_high:.0f} 点。\n"
+            f"🧠 **AI 深度形态解盘**:\n"
+            f"   • {insights_str}\n"
+        )
     except Exception as e:
         log.warning(f"大盘基准获取失败: {e}")
+        market_msg = f"大盘基准获取失败: {e}\n"
 
-    # 如果抓到空数据或被反爬封锁
+    # 如果抓到空数据或被反爬封锁 (触发短路保护)
     if len(df_raw) < 1000:
-        return pd.DataFrame(), market_ok, market_msg + "⚠️ 个股横截面数据获取失败，无法计算情绪指标。", index_ret
+        return pd.DataFrame(), market_ok, market_msg + "\n⚠️ 个股横截面数据获取失败，无法计算情绪指标。", index_ret
 
     try:
         up_count = (df_raw[C.S_PCT] > 0).sum()
@@ -414,18 +493,17 @@ def extract_market_context(df_raw: pd.DataFrame, c_conf: Config) -> tuple[pd.Dat
         breadth = up_count / (up_count + down_count) if (up_count + down_count) > 0 else 0.5
         advice = ""
         if market_ok and breadth >= 0.6:
-            advice = "🔥 赚钱效应极佳 (建议仓位 60%-80%)，积极做多，顺势加仓主线强势股。"
+            advice = "🔥 赚钱效应极佳 (建议仓位 60%-80%)，主升浪环境，积极做多主线强势股。"
         elif market_ok and breadth < 0.6:
-            advice = "⚠️ 指数安全但个股分化 (建议仓位 40%-60%)，切忌盲目追高，去弱留强聚焦核心逻辑。"
+            advice = "⚠️ 指数安全但个股分化 (建议仓位 40%-60%)，轻指数重个股，切忌盲目追高，去弱留强。"
         elif not market_ok and breadth <= 0.3:
-            advice = "🧊 情绪绝对冰点 (建议仓位 10%-20%)，系统性风险释放中，仅适合极小仓位博弈逆势妖股或空仓观望。"
+            advice = "🧊 情绪绝对冰点 (建议仓位 10%-20%)，系统性风险释放中，多看少动或极小仓位试错。"
         else:
             advice = "🛡️ 弱势震荡市 (建议仓位 20%-40%)，亏钱效应蔓延，严格控制回撤与止损纪律。"
 
         market_msg += (
-            f"🌡️ 市场情绪: 上涨 {up_count} 家 / 下跌 {down_count} 家 (涨停 {zt_count} / 跌停 {dt_count})\n"
-            f"💰 实时量能: 两市总成交额约 {total_amt:.0f} 亿元\n"
-            f"💡 操盘策略: {advice}"
+            f"🌡️ **市场情绪与资金**: 上涨 {up_count} 家 / 下跌 {down_count} 家 (涨跌停比: {zt_count}/{dt_count}) | 两市量能: {total_amt:.0f} 亿\n"
+            f"💡 **AI 综合操盘建议**: {advice}"
         )
     except Exception as e:
         log.warning(f"横截面情绪计算异常: {e}")
@@ -443,21 +521,21 @@ def get_signals() -> tuple[list[Signal], set, int, str]:
 
     c_conf, pushed = Config(), load_pushed_state()
     
-    # ── 【核心修复 1】：手动销毁阻塞的横截面请求 ──
+    # ── 手动销毁阻塞的横截面请求，根除假死耗时 ──
     ex1 = ThreadPoolExecutor(max_workers=2)
     f_spot = ex1.submit(fetch_spot)
     f_flow = ex1.submit(get_fund_flow_map)
     df_raw = pd.DataFrame()
     flow_map = {}
     try:
-        df_raw = f_spot.result(timeout=40) # 允许40秒的最长等待
+        df_raw = f_spot.result(timeout=40) 
         flow_map = f_flow.result(timeout=20)
     except FuturesTimeoutError:
         log.error("❌ 行情或资金流请求严重超时(>40s)，触发系统防卡死降级处理。")
     except Exception as e:
         log.error(f"❌ 横截面数据获取失败: {e}")
     finally:
-        ex1.shutdown(wait=False, cancel_futures=True) # 绝不等待，立即释放死锁的线程！
+        ex1.shutdown(wait=False, cancel_futures=True) 
 
     df_clean, m_ok, m_msg, idx_ret = extract_market_context(df_raw, c_conf)
     log.info(f"📈 扫描全市场宏观:\n{m_msg}")
@@ -485,21 +563,19 @@ def get_signals() -> tuple[list[Signal], set, int, str]:
     candidate_data = []
     end_s, start_s = now.strftime('%Y%m%d'), (now - timedelta(days=450)).strftime('%Y%m%d')
     
-    # ── 【核心修复 2】：硬截断耗时超长的 K线池分析 ──
+    # ── 硬截断耗时超长的 K线池分析 ──
     ex2 = ThreadPoolExecutor(max_workers=10)
     futures = {ex2.submit(fetch_hist, r[C.S_CODE], start_s, end_s): r for _, r in pool.iterrows()}
     
     try:
-        # 整体任务限制：即使标的再多，最多只处理 90 秒，超出的个股直接截断放弃
         for f in as_completed(futures, timeout=90):
             row = futures[f]
             try:
-                hist = f.result(timeout=5) # 单只股票处理不能卡死超过5秒
+                hist = f.result(timeout=5)
                 result = process_stock(row, hist, now, m_ok, idx_ret, flow_map.get(row[C.S_CODE], 0.0))
                 if result:
                     data, stop, risk = result
                     
-                    # 极速获取板块：防止该步骤卡死
                     try:
                         sector = fetch_stock_sector(row[C.S_CODE])
                     except:
@@ -533,7 +609,7 @@ def get_signals() -> tuple[list[Signal], set, int, str]:
     except FuturesTimeoutError:
         log.warning("⏳ 个股深度运算触发 90 秒总体强制熔断，已停止分析余下标的保护时间分配。")
     finally:
-        ex2.shutdown(wait=False, cancel_futures=True) # 无情杀掉后台还在等数据的线程
+        ex2.shutdown(wait=False, cancel_futures=True)
 
     candidate_data.sort(key=lambda x: x.score, reverse=True)
     return candidate_data, pushed, len(pool), m_msg

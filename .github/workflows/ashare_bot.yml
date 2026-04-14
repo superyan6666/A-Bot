@@ -6,10 +6,19 @@ on:
     - cron: '*/30 1-3,5-7 * * 1-5'
   workflow_dispatch:
     inputs:
+      # 增加功能测试下拉菜单
+      run_mode:
+        description: '运行模式 (执行全量扫描 / 仅测试连通性)'
+        required: true
+        default: 'normal'
+        type: choice
+        options:
+          - normal
+          - test_conn
       push_empty:
         description: '是否在无信号时也推送状态报告？'
         required: false
-        default: 'false'
+        default: false
         type: boolean
 
 permissions:
@@ -24,33 +33,59 @@ jobs:
     timeout-minutes: 4
     
     steps:
+      # 【一致性修复 1】：升级至 v4，消除 Node 16 废弃警告，加快启动速度
       - name: 检出代码
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: 搭建 Python 环境
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: '3.10'
 
-      # 利用缓存跳过 pip 安装，减少运行时间 ~45 秒
+      # 利用缓存跳过 C/C++ 库(如 numpy, pandas)的编译与下载，大幅提速
       - name: 缓存 pip 依赖
-        uses: actions/cache@v3
+        uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-quant-v1
+          key: ${{ runner.os }}-pip-quant-v2
+          restore-keys: |
+            ${{ runner.os }}-pip-quant-
 
+      # 【一致性修复 2】：必须追加 --upgrade 参数！
+      # 核心原理：让大型库(pandas/numpy)命中缓存极速安装，同时强迫 pip 检查并拉取最新版的 akshare，防止接口变动导致系统瘫痪。
       - name: 安装依赖
         run: |
-          pip install akshare pandas numpy requests pytz
+          python -m pip install --upgrade pip
+          pip install --upgrade akshare pandas numpy requests pytz
 
-      - name: 启动监控引擎
+      - name: 启动监控引擎 / 测试连通性
         env:
           DINGTALK_WEBHOOK: ${{ secrets.DINGTALK_WEBHOOK }}
-          PUSH_EMPTY_RESULT: ${{ github.event.inputs.push_empty || 'false' }}
+          # 【一致性修复 3】：使用现代化的 inputs 上下文，逻辑运算更安全
+          PUSH_EMPTY_RESULT: ${{ inputs.push_empty || 'false' }}
+          RUN_MODE: ${{ inputs.run_mode || 'normal' }}
           PYTHONUNBUFFERED: "1"
-        run: python main.py
+        run: |
+          if [ "$RUN_MODE" == "test_conn" ]; then
+            echo "🔔 检测到测试模式，执行钉钉连通性推送..."
+            python -c "
+          import os, requests, datetime
+          webhook = os.environ.get('DINGTALK_WEBHOOK')
+          if not webhook:
+              print('❌ 未配置 DINGTALK_WEBHOOK 环境变量')
+              exit(1)
+          now = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+          msg = f'🤖 AI量化打板引擎 连通性测试成功！\n时间: {now}\n状态: GitHub Actions 触发器与网络链路完全畅通。'
+          res = requests.post(webhook, json={'msgtype': 'text', 'text': {'content': msg}}, timeout=10)
+          print('✅ 推送结果:', res.text)
+          "
+          else
+            echo "🚀 执行全量 A 股量化扫描..."
+            python main.py
+          fi
 
       - name: 保存运行状态
+        if: ${{ inputs.run_mode != 'test_conn' }} # 测试模式下不需要提交运行状态
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
           commit_message: "[bot] sync state"

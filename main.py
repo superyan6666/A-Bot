@@ -65,7 +65,8 @@ jobs:
         run: |
           if [ "$RUN_MODE" == "test_conn" ]; then
             echo "🔔 检测到测试模式，执行钉钉连通性推送..."
-            python -c "
+            # 使用安全的 Here-Doc 语法，避免任何 Bash 的双引号解析冲突
+            python - << 'EOF'
           import os, requests, datetime
           webhook = os.environ.get('DINGTALK_WEBHOOK')
           if not webhook:
@@ -75,7 +76,7 @@ jobs:
           msg = f'🤖 AI量化打板引擎 连通性测试成功！\n时间: {now}\n状态: GitHub Actions 触发器与网络链路完全畅通。'
           res = requests.post(webhook, json={'msgtype': 'text', 'text': {'content': msg}}, timeout=10)
           print('✅ 推送结果:', res.text)
-          "
+          EOF
           elif [ "$RUN_MODE" == "market_only" ]; then
             echo "📊 检测到大盘体检模式，开始扫描宏观资金与情绪指标..."
             python main.py

@@ -163,7 +163,8 @@ class MathUtils:
 # ── 4. 数据拉取模块 ────────────────────────────────────────────────────────────
 import akshare as ak
 
-def retry(times=3, delay=2, exceptions=(RequestException, ConnectionError, ValueError, pd.errors.EmptyDataError, socket.timeout)):
+# 【修正】：将 Exception 纳入重试捕获范围，针对 akshare 库不确定的网络抛错进行全面拦截
+def retry(times=4, delay=2, exceptions=(Exception,)):
     def decorator(fn):
         @wraps(fn)
         def wrapper(*args, **kwargs):
@@ -172,11 +173,19 @@ def retry(times=3, delay=2, exceptions=(RequestException, ConnectionError, Value
                     return fn(*args, **kwargs)
                 except exceptions as e:
                     if attempt < times - 1:
+                        log.debug(f"抓取受挫，将在 {delay * (2 ** attempt)}s 后重试: {e}")
                         time.sleep(delay * (2 ** attempt))
                     else:
                         raise
         return wrapper
     return decorator
+
+@retry(times=4, delay=2)
+def fetch_index(symbol: str) -> pd.DataFrame:
+    """带重试护甲的指数获取器"""
+    df = ak.stock_zh_index_daily_em(symbol=symbol)
+    if df is None or df.empty: raise ValueError(f'index_empty_{symbol}')
+    return df
 
 @retry(times=3, delay=2)
 def fetch_hist(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
@@ -393,9 +402,10 @@ def extract_pure_market_context() -> str:
     """完全短路横截面的纯指数深度体检：包含三大股指分化、全市场量能与 AI 极值解析"""
     market_msg = ""
     try:
-        sh_df = ak.stock_zh_index_daily_em(symbol='sh000001')
-        sz_df = ak.stock_zh_index_daily_em(symbol='sz399001')
-        cyb_df = ak.stock_zh_index_daily_em(symbol='sz399006')
+        # 使用全新的带自动重试装甲的抓取方法
+        sh_df = fetch_index('sh000001')
+        sz_df = fetch_index('sz399001')
+        cyb_df = fetch_index('sz399006')
 
         cl = sh_df['close']
         vol = sh_df['volume']
@@ -496,7 +506,7 @@ def extract_market_context(df_raw: pd.DataFrame, c_conf: Config) -> tuple[pd.Dat
     
     market_ok, market_msg, index_ret = True, "", 0.0
     try:
-        idx_df = ak.stock_zh_index_daily_em(symbol='sh000001')
+        idx_df = fetch_index('sh000001')
         cl = idx_df[C.I_CLOSE]
         ma20 = cl.rolling(20).mean().iloc[-1]
         pct = (cl.iloc[-1] - cl.iloc[-2]) / cl.iloc[-2] * 100

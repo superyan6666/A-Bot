@@ -374,10 +374,10 @@ class AShareTechnicals:
         
         price_pct = (today[C.H_CLOSE] - min_1y) / rng
         
-        if price_pct > 0.96: return None 
-        if today[C.H_CLOSE] < today['MA20'] * 0.95: return None
+        # 【致命杀手移除】：完全删除 price_pct > 0.96 的物理拦截，彻底解放正在创出新高的主升浪龙头！
         
-        # 【致命杀手移除】：完全移除了对 MACD 绝对值的物理阻断 (today['DIF'] > -0.25)，将判断交由均线趋势！
+        # 【放宽容忍度】：允许大幅假摔洗盘（最高允许跌破20日线10%），由后续打分引擎根据整体趋势判断优劣
+        if today[C.H_CLOSE] < today['MA20'] * 0.90: return None
 
         rsi = float(today.get('RSI14', 50))
         if pd.isna(rsi) or rsi > 85: return None 
@@ -405,7 +405,6 @@ class AShareTechnicals:
             if df[C.H_CLOSE].iloc[-i] > df[C.H_OPEN].iloc[-i]: red_days += 1
             else: break
             
-        # 【数值量级修正】：修正了涨跌幅的区间对比逻辑，放宽回踩洗盘成交量的容忍度，包容主力带量诱空
         has_pullback = bool(
             today[C.H_CLOSE] >= today['MA20'] * 0.97 and 
             today[C.H_VOL] < today['MA5_V'] * 1.2 and
@@ -459,18 +458,16 @@ def apply_scoring(data: dict, now: datetime) -> tuple[int, str, str]:
         
         Factor(lambda d: d['price_pct'] < 0.25, 15, rw, "🟢 【绝对低位】目前买入相当于抄底，长线拿着不慌"),
         Factor(lambda d: 0.25 <= d['price_pct'] <= 0.45, 10, 1.0, "🟢 【相对低位】刚刚从底部爬起来，输时间不输钱"),
-        Factor(lambda d: 0.45 < d['price_pct'] <= 0.85, 8, 1.0, "🚀 【多头趋势】股价已脱离底部，处于健康的主升浪区间"),
+        # 【逻辑优化】：将主升浪加分域完全覆盖至 1.0，只要冲破底部脱离盘整区，全量给予高分奖励
+        Factor(lambda d: d['price_pct'] > 0.45, 8, 1.0, "🚀 【多头趋势】股价已脱离底部，处于健康的主升浪区间"),
         
         Factor(lambda d: d['pe'] > 0 and d['pe'] < 40, 8, 1.0, "🛡️ 【业绩护体】市盈率健康，不是炒空气的垃圾股"),
         Factor(lambda d: d['macd_dea'] >= -0.05, 8, 1.0, "🌊 【多头控盘】大周期趋势仍强，没有深套风险"), 
         
-        # 【均线洁癖修复】：扩宽低吸加分域，-2.0% 内的轻微假摔均给予满级 15 分重奖！
         Factor(lambda d: -2.0 <= d['dist_ma20'] <= 6.0, 15, 1.0, "🧲 【贴地潜伏】目前价格紧贴均线支撑，属于绝佳的安全低吸点"),
         Factor(lambda d: 6.0 < d['dist_ma20'] <= 15.0, 8, 1.0, "🚀 【强势发力】距离20日线有一定空间，依托短期均线强势上攻"),
-        # 【均线洁癖修复】：只重罚真正破位走弱（低于-2.0%）的股票，放过温和洗盘的黄金坑
         Factor(lambda d: d['dist_ma20'] < -2.0, -10, 1.0, "⚠️ 【破位嫌疑】当前已明显跌破20日线，需警惕趋势走坏(已扣分)"),
         
-        # 【限制放宽】：将 RSI 健康区间扩宽，包容超卖后的起爆和钝化后的洗盘
         Factor(lambda d: 30 <= d.get('rsi', 50) <= 72, 10, 1.0, "📊 【温度适中】RSI处于健康买入区间，不冷不热正是下手时机"),
         
         Factor(lambda d: d['bull_rank'], 10, 1.0, "📈 【顺势而为】均线多头排列，跟着主力资金大部队走"),
@@ -494,9 +491,11 @@ def apply_scoring(data: dict, now: datetime) -> tuple[int, str, str]:
         Factor(lambda d: d.get('rsi', 50) > 80, -10, 1.0, "🌡️ 【微过热】RSI偏高，短线超买迹象，操作需要更小的仓位"),
         Factor(lambda d: d.get('rs_rating', 0) < -10, -8, 1.0, "📉 【跑输大盘】近期持续弱于大盘，跟的是被市场冷落的股票"),
         Factor(lambda d: d['has_consecutive_zt'] and d['price_pct'] < 0.40, 10, 1.0, "🔥🔥 【低位连板】刚刚启动的龙头，安全且辨识度高"),
-        Factor(lambda d: d['has_consecutive_zt'] and d['price_pct'] >= 0.85, -20, 1.0, "⚠️ 【高位接盘】股价已被炒高连板，千万别追，容易接盘！"),
+        # 【微调惩罚】：仅当价格分位极高 (>=0.90) 且连板时才扣除 15 分，不过度恐吓强势龙头股
+        Factor(lambda d: d['has_consecutive_zt'] and d['price_pct'] >= 0.90, -15, 1.0, "⚠️ 【高位接盘】股价已被炒高连板，千万别追，容易接盘！"),
         Factor(lambda d: d['upper_shadow_pct'] > 18, -15, 1.0, "⚠️ 【诱多预警】冲高后大幅跳水，上方抛压极重，别上当"),
-        Factor(lambda d: d['dist_ma20'] > 20, -20, 1.0, "🚫 【追高预警】目前涨得太急离均线太远，随时面临暴跌回调"),
+        # 【微调惩罚】：放宽短期均线乖离偏离度的容忍范围（>25%才重罚）
+        Factor(lambda d: d['dist_ma20'] > 25, -15, 1.0, "🚫 【追高预警】目前涨得太急离均线太远，随时面临暴跌回调"),
         
         Factor(lambda d: in_danger and d['mcap'] < 100e8, -8, 1.0, f"📅 【财报防守】当前属于{danger_label}高危期，小盘股需防业绩变脸(已扣分)")
     ]
@@ -530,7 +529,8 @@ def is_valid_run_time(now: datetime) -> bool:
     return t >= 1505
 
 def process_stock(row: pd.Series, raw_hist: pd.DataFrame, now: datetime, market_ok: bool, index_ret: float) -> Optional[tuple]:
-    if len(raw_hist) < 250: return None
+    # 【致命杀手移除】：将历史 K 线要求从严苛的 250 根（1年）放宽至 120 根（约半年），彻底解救次新活跃科技股
+    if len(raw_hist) < 120: return None
     
     hist = raw_hist.copy()
     if str(hist[C.H_DATE].iloc[-1]) != now.strftime('%Y-%m-%d') and is_valid_run_time(now):
@@ -560,7 +560,8 @@ def process_stock(row: pd.Series, raw_hist: pd.DataFrame, now: datetime, market_
     stop = max(valid_supports + [row[C.S_PRICE] * 0.88]) * 0.993 
     risk_pct = ((row[C.S_PRICE] - stop) / row[C.S_PRICE]) * 100 if row[C.S_PRICE] > 0 else 99
     
-    if risk_pct > 15.0: return None 
+    # 【放宽物理防线】：容忍度从 15% 提升至 25%，接纳高波动大牛股
+    if risk_pct > 25.0: return None 
 
     return (data, stop, risk_pct) 
 
@@ -657,7 +658,6 @@ def get_signals() -> tuple[list[Signal], list, set, int, str, int]:
         df_clean = df_clean[df_clean[C.S_CODE].isin(core_pool)]
         log.info(f"💎 已开启【核心优质股池】模式，限定扫描 {len(core_pool)} 只国家队核心及高弹性成分股。")
 
-    # 【漏洞修复：已打通备用源初筛假数据拦截通道】
     pe_cond = (df_clean[C.S_PE] > c_conf.MIN_PE) | (df_clean[C.S_PE] == -1.0)
     
     mask = (df_clean[C.S_PCT] >= c_conf.MIN_PCT_CHG) & \
@@ -688,10 +688,11 @@ def get_signals() -> tuple[list[Signal], list, set, int, str, int]:
     futures = {ex2.submit(fetch_hist, r[C.S_CODE], start_s, end_s): r for _, r in pool.iterrows()}
     
     try:
+        # 【通信稳定性升级】：移除单条数据的强行5秒超时限制，防止因API偶发卡顿造成静默丢失，并通过 log 打印异常明细
         for f in as_completed(futures, timeout=240): 
             row = futures[f]
             try:
-                hist = f.result(timeout=5)
+                hist = f.result()
                 result = process_stock(row, hist, now, m_ok, idx_ret)
                 if result:
                     data, stop, risk = result
@@ -719,7 +720,8 @@ def get_signals() -> tuple[list[Signal], list, set, int, str, int]:
                     elif score >= 60:  
                         watchlist_data.append((row[C.S_NAME], row[C.S_CODE], score, row[C.S_PRICE]))
                         
-            except Exception:
+            except Exception as e:
+                log.debug(f"计算个股 {row[C.S_CODE]} 时发生异常或被过滤: {e}")
                 pass
     except FuturesTimeoutError:
         log.warning("⚠️ 后台运算达到极值，提前熔断保存已有成果。")

@@ -271,10 +271,9 @@ def fetch_index(symbol: str) -> pd.DataFrame:
 
 @retry(times=3, delay=2)
 def fetch_core_pool() -> set:
-    """【扩容】获取沪深300 + 中证500 + 中证1000 + 创业板指，囊括蓝筹与高成长核心资产"""
+    """获取沪深300 + 中证500 + 中证1000 + 创业板指，囊括蓝筹与高成长核心资产"""
     pool = set()
     try:
-        # 000300: 沪深300, 000905: 中证500, 000852: 中证1000, 399006: 创业板指
         for idx in ["000300", "000905", "000852", "399006"]:
             df = ak.index_stock_cons(symbol=idx)
             if df is not None and not df.empty:
@@ -378,7 +377,7 @@ class AShareTechnicals:
         if price_pct > 0.96: return None 
         if today[C.H_CLOSE] < today['MA20'] * 0.95: return None
         
-        if not (today['DIF'] >= today['DEA'] or today['DIF'] > -0.25): return None
+        # 【致命杀手移除】：完全移除了对 MACD 绝对值的物理阻断 (today['DIF'] > -0.25)，将判断交由均线趋势！
 
         rsi = float(today.get('RSI14', 50))
         if pd.isna(rsi) or rsi > 85: return None 
@@ -406,11 +405,11 @@ class AShareTechnicals:
             if df[C.H_CLOSE].iloc[-i] > df[C.H_OPEN].iloc[-i]: red_days += 1
             else: break
             
-        # 【致命修正】：将原来荒谬的 100倍 量级差距 (-0.05) 修正为正确的百分点比值 (-5.0)
+        # 【数值量级修正】：修正了涨跌幅的区间对比逻辑，放宽回踩洗盘成交量的容忍度，包容主力带量诱空
         has_pullback = bool(
-            today[C.H_CLOSE] >= today['MA20'] and 
-            today[C.H_VOL] < today['MA5_V'] * 0.9 and
-            -5.0 <= df['PCT_CHG'].iloc[-1] <= 2.0
+            today[C.H_CLOSE] >= today['MA20'] * 0.97 and 
+            today[C.H_VOL] < today['MA5_V'] * 1.2 and
+            -6.0 <= df['PCT_CHG'].iloc[-1] <= 3.5
         )
 
         return {
@@ -453,37 +452,39 @@ def apply_scoring(data: dict, now: datetime) -> tuple[int, str, str]:
 
     in_danger, danger_label = is_earnings_danger_zone(now)
 
-    # 【深度清理】：已彻底铲除 Sector 板块相关的幽灵因子代码
     factors = [
         Factor(lambda d: d['mcap'] > 300e8 and 0 < d['pe'] < 25 and d['pb'] < 3, 12, 1.0, "🏢 【价值蓝筹】大市值低估值核心资产，防守属性极强"),
-        Factor(lambda d: str(d.get('code', '')).startswith('300') and d['vol_ratio'] > 1.2 and d['rs_rating'] > 5, 12, 1.0, "🚀 【弹性成长】创业板高弹性成长标的，接力意愿强"),
+        Factor(lambda d: d['vol_ratio'] > 1.0 and d['rs_rating'] > 5, 12, 1.0, "🚀 【强势领涨】近期显著强于大盘，资金接力意愿极强"),
         Factor(lambda d: d['price_pct'] < 0.3 and 0 < d['pb'] < 1.0, 10, 1.0, "♻️ 【困境反转】股价严重破净且处于绝对低位，安全垫极厚"),
         
         Factor(lambda d: d['price_pct'] < 0.25, 15, rw, "🟢 【绝对低位】目前买入相当于抄底，长线拿着不慌"),
         Factor(lambda d: 0.25 <= d['price_pct'] <= 0.45, 10, 1.0, "🟢 【相对低位】刚刚从底部爬起来，输时间不输钱"),
         Factor(lambda d: 0.45 < d['price_pct'] <= 0.85, 8, 1.0, "🚀 【多头趋势】股价已脱离底部，处于健康的主升浪区间"),
         
-        Factor(lambda d: d['pe'] > 0 and d['pe'] < 30, 8, 1.0, "🛡️ 【业绩护体】市盈率健康，不是炒空气的垃圾股"),
-        Factor(lambda d: d['macd_dea'] >= -0.05, 8, 1.0, "🌊 【多头控盘】MACD处于强势零轴附近，没有深套风险"), 
+        Factor(lambda d: d['pe'] > 0 and d['pe'] < 40, 8, 1.0, "🛡️ 【业绩护体】市盈率健康，不是炒空气的垃圾股"),
+        Factor(lambda d: d['macd_dea'] >= -0.05, 8, 1.0, "🌊 【多头控盘】大周期趋势仍强，没有深套风险"), 
         
-        Factor(lambda d: 0 <= d['dist_ma20'] <= 6.0, 15, 1.0, "🧲 【贴地潜伏】目前价格紧贴支撑线，属于绝佳的安全低吸点，没追高"),
-        Factor(lambda d: 6.0 < d['dist_ma20'] <= 12.0, 8, 1.0, "🚀 【强势上攻】距离20日线有一定空间，依托10日线强势上攻"),
-        Factor(lambda d: d['dist_ma20'] < 0, -10, 1.0, "⚠️ 【破位嫌疑】当前处于20日线下方，属于弱势反弹，需警惕冲高回落"),
+        # 【均线洁癖修复】：扩宽低吸加分域，-2.0% 内的轻微假摔均给予满级 15 分重奖！
+        Factor(lambda d: -2.0 <= d['dist_ma20'] <= 6.0, 15, 1.0, "🧲 【贴地潜伏】目前价格紧贴均线支撑，属于绝佳的安全低吸点"),
+        Factor(lambda d: 6.0 < d['dist_ma20'] <= 15.0, 8, 1.0, "🚀 【强势发力】距离20日线有一定空间，依托短期均线强势上攻"),
+        # 【均线洁癖修复】：只重罚真正破位走弱（低于-2.0%）的股票，放过温和洗盘的黄金坑
+        Factor(lambda d: d['dist_ma20'] < -2.0, -10, 1.0, "⚠️ 【破位嫌疑】当前已明显跌破20日线，需警惕趋势走坏(已扣分)"),
         
-        Factor(lambda d: 35 <= d.get('rsi', 50) <= 68, 10, 1.0, "📊 【温度适中】RSI处于健康买入区间，不冷不热正是下手时机"),
+        # 【限制放宽】：将 RSI 健康区间扩宽，包容超卖后的起爆和钝化后的洗盘
+        Factor(lambda d: 30 <= d.get('rsi', 50) <= 72, 10, 1.0, "📊 【温度适中】RSI处于健康买入区间，不冷不热正是下手时机"),
         
         Factor(lambda d: d['bull_rank'], 10, 1.0, "📈 【顺势而为】均线多头排列，跟着主力资金大部队走"),
         Factor(lambda d: d['ma_convergence'], 12, 1.0, "🌪️ 【面临变盘】短期和长期成本几乎重合，随时向上爆发"), 
         
         Factor(lambda d: d['has_zt'], 10, 1.0, "🔥 【股性活跃】这只股历史上容易涨停，不会一潭死水"),
         Factor(lambda d: d['vol_ratio'] >= 1.8, 10, 1.0, "🔵 【放量确认】今天成交量明显放大，大资金开始干活了"),
-        Factor(lambda d: d['red_days'] >= 3, 8, 1.0, "🔴 【稳步推升】连续几天都在涨，主力在偷偷温和建仓"),
+        Factor(lambda d: d['red_days'] >= 2, 8, 1.0, "🔴 【稳步推升】最近重心都在上移，主力在偷偷温和建仓"),
         
         Factor(lambda d: d['has_chip_break'], 15, tw, "🏔️ 【抛压真空】上方的套牢盘已割肉离场，向上拉升没阻力"),
         Factor(lambda d: d['vcp_amp'] < 0.12, 10, 1.0, "🟣 【蓄势待发】近期上下波动极小，主力控盘很稳即将出方向"),
         Factor(lambda d: d['extreme_shrink_vol'], 10, 1.0, "🧊 【没人砸盘】爆发前夕成交量极度萎缩，散户该卖的都卖了"), 
         Factor(lambda d: d['has_obv_break'], 10, tw, "💸 【真金白银】模型监控到真实的资金在创纪录买入"),
-        Factor(lambda d: d['has_pullback'], 15, 1.0, "🪃 【上车机会】温和缩量回踩，主力洗盘挖坑给的上车机会"),
+        Factor(lambda d: d['has_pullback'], 15, 1.0, "🪃 【上车机会】温和缩量回踩洗盘，主力挖坑给出的上车机会"),
         Factor(lambda d: d['lower_shadow_ratio'] > 0.03, 8, 1.0, "📌 【强力护盘】跌下去被大资金迅速买回，下方有人兜底"), 
         
         Factor(lambda d: d.get('rs_rating', 0) > 5,  8, 1.0, "🏆 【跑赢大盘】近60日涨幅超越指数，说明有资金在持续选择它"),
@@ -495,12 +496,12 @@ def apply_scoring(data: dict, now: datetime) -> tuple[int, str, str]:
         Factor(lambda d: d['has_consecutive_zt'] and d['price_pct'] < 0.40, 10, 1.0, "🔥🔥 【低位连板】刚刚启动的龙头，安全且辨识度高"),
         Factor(lambda d: d['has_consecutive_zt'] and d['price_pct'] >= 0.85, -20, 1.0, "⚠️ 【高位接盘】股价已被炒高连板，千万别追，容易接盘！"),
         Factor(lambda d: d['upper_shadow_pct'] > 18, -15, 1.0, "⚠️ 【诱多预警】冲高后大幅跳水，上方抛压极重，别上当"),
-        Factor(lambda d: d['dist_ma20'] > 18, -20, 1.0, "🚫 【追高预警】目前涨得太急离均线太远，随时面临暴跌回调"),
+        Factor(lambda d: d['dist_ma20'] > 20, -20, 1.0, "🚫 【追高预警】目前涨得太急离均线太远，随时面临暴跌回调"),
         
         Factor(lambda d: in_danger and d['mcap'] < 100e8, -8, 1.0, f"📅 【财报防守】当前属于{danger_label}高危期，小盘股需防业绩变脸(已扣分)")
     ]
 
-    score, reasons = 50, [meta] if meta else []
+    score, reasons = 55, [meta] if meta else []
     
     for f in factors:
         if f.condition(data):
@@ -656,7 +657,7 @@ def get_signals() -> tuple[list[Signal], list, set, int, str, int]:
         df_clean = df_clean[df_clean[C.S_CODE].isin(core_pool)]
         log.info(f"💎 已开启【核心优质股池】模式，限定扫描 {len(core_pool)} 只国家队核心及高弹性成分股。")
 
-    # 【致命修复】：接纳并放行所有备用源假数据（PE == -1.0），防止新浪源触发时全军覆没
+    # 【漏洞修复：已打通备用源初筛假数据拦截通道】
     pe_cond = (df_clean[C.S_PE] > c_conf.MIN_PE) | (df_clean[C.S_PE] == -1.0)
     
     mask = (df_clean[C.S_PCT] >= c_conf.MIN_PCT_CHG) & \

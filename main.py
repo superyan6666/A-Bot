@@ -132,7 +132,7 @@ class Signal:
     hold_period_msg: str = ""
 
 
-# ── 3. 小白防呆专享算法库 ──────────────────────────────────────────────────────
+# ── 3. 小白防呆专享排版算法库 ──────────────────────────────────────────────────
 class MathUtils:
     @staticmethod
     def calc_atr_adx(hist: pd.DataFrame, period: int = 14) -> Tuple[pd.Series, pd.Series]:
@@ -176,22 +176,22 @@ def format_money_risk_msg(price: float, stop_loss: float, target1: float) -> str
     ratio_str = f"{ratio:.1f}"
     
     if ratio >= 2.5:
-        evaluation = "🎯 【高容错】做对一次赚的钱能抵消两三次亏损，试错成本低！"
+        evaluation = "🎯 **高容错**：做对一次抵消多次亏损！"
     elif ratio >= 1.5:
-        evaluation = "✅ 【尚可】盈亏比较好，跌势有限，可以防守建仓。"
+        evaluation = "✅ **尚可**：跌势有限，可防守建仓。"
     else:
-        evaluation = "⚠️ 【需谨慎】盈亏比勉强持平，对操作精准度要求高，新手请把买入金额减半！"
+        evaluation = "⚠️ **需谨慎**：操作要求高，务必**减半仓位**！"
     
     return (
-        f"💸 **小白算账（以 1 万元预算为例：约买 {hands} 手 = ¥{total_cost:.0f}）**\n"
-        f"   🔴 极度悲观：触发止损，你大概会亏 ¥{total_loss:.0f}\n"
-        f"   🟢 保守预期：达到第一目标，大概能赚 ¥{gain_1:.0f}\n"
-        f"   📐 盈亏性价比 1 : {ratio_str} ➡️ {evaluation}"
+        f"- 💸 **仓位测算**：买 {hands} 手约需 `¥{total_cost:.0f}` (按1万预算计)\n"
+        f"- 🔴 **止损风险**：预估最大回撤约 `-¥{total_loss:.0f}`\n"
+        f"- 🟢 **止盈目标**：第一波段预估盈利 `+¥{gain_1:.0f}`\n"
+        f"- 📐 **盈亏比**：`1 : {ratio_str}` ➡️ {evaluation}"
     )
 
 def generate_tranche_plan(price: float, score: int, market_ok: bool, market_overheated: bool) -> str:
     if market_overheated:
-        return "🛑 **【系统熔断】当前市场情绪极度过热，随时面临收割踩踏！系统强制禁止明日建仓，请管住手！**"
+        return "🛑 **【系统熔断】当前市场情绪极度过热！随时面临收割踩踏，系统强制禁止明日建仓！**"
         
     base_pct = 30 if score >= 85 else 20 if score >= 70 else 10
     if not market_ok:
@@ -206,11 +206,9 @@ def generate_tranche_plan(price: float, score: int, market_ok: bool, market_over
     stop_add    = round(price * 1.05,  2)
     
     return (
-        f"📋 **明日操作计划（今晚设好条件单，明天不用盯盘）**\n"
-        f"   ① 【挂单埋伏】以 ¥{limit_price} 限价挂买入 {t1}% 仓位，成交了就等，没成交就算\n"
-        f"   ② 【稳健加仓】如果明后天没跌且站稳 ¥{add_price}，再加 {t2}%\n"
-        f"   ③ 【追击确认】如果继续上涨突破 ¥{stop_add}，最后追加 {t3}%\n"
-        f"   🔒 铁律：限价单没成交 → 不追市价！宁可踏空，绝不接盘高位。"
+        f"- **① 挂单埋伏**：限价 `¥{limit_price}` 买入 **{t1}%** 仓位 (没成交不追高)\n"
+        f"- **② 稳健加仓**：明后天企稳 `¥{add_price}`，再加 **{t2}%**\n"
+        f"- **③ 追击确认**：突破上行 `¥{stop_add}`，最后追加 **{t3}%**"
     )
 
 def generate_plan_b(price: float, stop_loss: float, ma20: float) -> str:
@@ -218,20 +216,18 @@ def generate_plan_b(price: float, stop_loss: float, ma20: float) -> str:
     normal_shake = max(normal_shake, stop_loss + 0.01)
     
     return (
-        f"🆘 **如果买入后跌了怎么办？(心理防线预演)**\n"
-        f"   ▪️ 回撤在 ¥{normal_shake:.2f} 以上 → 纯属正常的洗盘波动，千万别自己吓自己，持仓装死别动。\n"
-        f"   ▪️ 跌破 ¥{stop_loss:.2f} (铁血止损) → 意味着趋势彻底被破坏，立刻无条件割肉离场，保住大本金！\n"
-        f"   ▪️ 在 ¥{stop_loss:.2f} ~ ¥{normal_shake:.2f} 之间 → 观察成交量，缩量就扛着，放巨量或破20日线(¥{ma20:.2f})减仓。\n"
-        f"   ▪️ 大盘突然崩盘(千股大跌) → 别管盈亏，立刻先清掉一半，躲过风暴再说。"
+        f"- **📉 正常洗盘**：只要收盘不破 `¥{normal_shake:.2f}`，装死别动。\n"
+        f"- **🔪 铁血割肉**：有效跌破 `¥{stop_loss:.2f}`，无条件止损离场！\n"
+        f"- **💥 大盘暴跌**：如果遇到千股跌停，立刻清仓一半，保命要紧。"
     )
 
 def generate_hold_period(adx: float, price_pct: float, has_chip_break: bool) -> str:
     if price_pct < 0.35 and adx < 20:
-        return "🐢 **持股预期**：这是【底部潜伏型】，主力还在偷偷吸筹。可能需要拿 1~3 个月才会大涨，买完千万别天天盯盘，就当存死期。"
+        return "- **⏳ 持股预期**：🐢 **【底部潜伏型】(1~3个月)**，存死期别盯盘。"
     elif adx > 25 or has_chip_break:
-        return "🐎 **持股预期**：这是【右侧趋势型】，随时可能加速。快的话 3~5 个交易日，慢的话两周。见好就收，切忌贪心！"
+        return "- **⏳ 持股预期**：🐎 **【右侧趋势型】(3~10天)**，随时加速，切忌贪心。"
     else:
-        return "🐕 **持股预期**：这是【稳健震荡型】，需要一点耐心，预计持有 2~4 周等风来。"
+        return "- **⏳ 持股预期**：🐕 **【稳健震荡型】(2~4周)**，需要耐心等风来。"
 
 
 # ── 4. 数据拉取模块 ────────────────────────────────────────────────────────────
@@ -374,9 +370,6 @@ class AShareTechnicals:
         
         price_pct = (today[C.H_CLOSE] - min_1y) / rng
         
-        # 【致命杀手移除】：完全删除 price_pct > 0.96 的物理拦截，彻底解放正在创出新高的主升浪龙头！
-        
-        # 【放宽容忍度】：允许大幅假摔洗盘（最高允许跌破20日线10%），由后续打分引擎根据整体趋势判断优劣
         if today[C.H_CLOSE] < today['MA20'] * 0.90: return None
 
         rsi = float(today.get('RSI14', 50))
@@ -447,57 +440,55 @@ class Factor:
 def apply_scoring(data: dict, now: datetime) -> tuple[int, str, str]:
     adx = data['adx']
     tw, rw = (1.4, 0.7) if adx > 25 else (0.8, 1.4) if adx < 15 else (1.0, 1.0)
-    meta = f"🧭 趋势雷达: {'处于主升浪' if adx > 25 else '处于底部反转期' if adx < 15 else '震荡蓄势中'}"
+    meta = f"- 🧭 **趋势雷达**：{'处于强势主升浪中' if adx > 25 else '正处于底部反转期' if adx < 15 else '平稳震荡蓄势中'}"
 
     in_danger, danger_label = is_earnings_danger_zone(now)
 
+    # 【深度排版升级】：所有理由均替换为 Markdown 原生无序列表格式 `- **高亮**：解释`
     factors = [
-        Factor(lambda d: d['mcap'] > 300e8 and 0 < d['pe'] < 25 and d['pb'] < 3, 12, 1.0, "🏢 【价值蓝筹】大市值低估值核心资产，防守属性极强"),
-        Factor(lambda d: d['vol_ratio'] > 1.0 and d['rs_rating'] > 5, 12, 1.0, "🚀 【强势领涨】近期显著强于大盘，资金接力意愿极强"),
-        Factor(lambda d: d['price_pct'] < 0.3 and 0 < d['pb'] < 1.0, 10, 1.0, "♻️ 【困境反转】股价严重破净且处于绝对低位，安全垫极厚"),
+        Factor(lambda d: d['mcap'] > 300e8 and 0 < d['pe'] < 25 and d['pb'] < 3, 12, 1.0, "- 🏢 **价值蓝筹**：大市值低估值核心资产，防守属性极强"),
+        Factor(lambda d: d['vol_ratio'] > 1.0 and d['rs_rating'] > 5, 12, 1.0, "- 🚀 **强势领涨**：近期显著强于大盘，资金接力意愿极强"),
+        Factor(lambda d: d['price_pct'] < 0.3 and 0 < d['pb'] < 1.0, 10, 1.0, "- ♻️ **困境反转**：股价严重破净且处于绝对低位，安全垫极厚"),
         
-        Factor(lambda d: d['price_pct'] < 0.25, 15, rw, "🟢 【绝对低位】目前买入相当于抄底，长线拿着不慌"),
-        Factor(lambda d: 0.25 <= d['price_pct'] <= 0.45, 10, 1.0, "🟢 【相对低位】刚刚从底部爬起来，输时间不输钱"),
-        # 【逻辑优化】：将主升浪加分域完全覆盖至 1.0，只要冲破底部脱离盘整区，全量给予高分奖励
-        Factor(lambda d: d['price_pct'] > 0.45, 8, 1.0, "🚀 【多头趋势】股价已脱离底部，处于健康的主升浪区间"),
+        Factor(lambda d: d['price_pct'] < 0.25, 15, rw, "- 🟢 **绝对低位**：目前买入相当于抄底，长线持有安全"),
+        Factor(lambda d: 0.25 <= d['price_pct'] <= 0.45, 10, 1.0, "- 🟢 **相对低位**：刚刚从底部爬起来，输时间不输钱"),
+        Factor(lambda d: d['price_pct'] > 0.45, 8, 1.0, "- 📈 **多头趋势**：股价已脱离底部，处于健康的主升浪区间"),
         
-        Factor(lambda d: d['pe'] > 0 and d['pe'] < 40, 8, 1.0, "🛡️ 【业绩护体】市盈率健康，不是炒空气的垃圾股"),
-        Factor(lambda d: d['macd_dea'] >= -0.05, 8, 1.0, "🌊 【多头控盘】大周期趋势仍强，没有深套风险"), 
+        Factor(lambda d: d['pe'] > 0 and d['pe'] < 40, 8, 1.0, "- 🛡️ **业绩护体**：市盈率健康，不是炒空气的无基本面股"),
+        Factor(lambda d: d['macd_dea'] >= -0.05, 8, 1.0, "- 🌊 **多头控盘**：大周期趋势仍强，没有被深套的风险"), 
         
-        Factor(lambda d: -2.0 <= d['dist_ma20'] <= 6.0, 15, 1.0, "🧲 【贴地潜伏】目前价格紧贴均线支撑，属于绝佳的安全低吸点"),
-        Factor(lambda d: 6.0 < d['dist_ma20'] <= 15.0, 8, 1.0, "🚀 【强势发力】距离20日线有一定空间，依托短期均线强势上攻"),
-        Factor(lambda d: d['dist_ma20'] < -2.0, -10, 1.0, "⚠️ 【破位嫌疑】当前已明显跌破20日线，需警惕趋势走坏(已扣分)"),
+        Factor(lambda d: -2.0 <= d['dist_ma20'] <= 6.0, 15, 1.0, "- 🧲 **贴地潜伏**：目前价格紧贴均线支撑，绝佳安全低吸点"),
+        Factor(lambda d: 6.0 < d['dist_ma20'] <= 15.0, 8, 1.0, "- 🚀 **强势发力**：距离20日线有空间，依托短期均线强势上攻"),
+        Factor(lambda d: d['dist_ma20'] < -2.0, -10, 1.0, "- ⚠️ **破位嫌疑**：当前已跌破20日线，需警惕趋势走坏 (扣分)"),
         
-        Factor(lambda d: 30 <= d.get('rsi', 50) <= 72, 10, 1.0, "📊 【温度适中】RSI处于健康买入区间，不冷不热正是下手时机"),
+        Factor(lambda d: 30 <= d.get('rsi', 50) <= 72, 10, 1.0, "- 📊 **温度适中**：RSI处于健康买入区间，正是下手时机"),
         
-        Factor(lambda d: d['bull_rank'], 10, 1.0, "📈 【顺势而为】均线多头排列，跟着主力资金大部队走"),
-        Factor(lambda d: d['ma_convergence'], 12, 1.0, "🌪️ 【面临变盘】短期和长期成本几乎重合，随时向上爆发"), 
+        Factor(lambda d: d['bull_rank'], 10, 1.0, "- 📈 **顺势而为**：均线多头排列，跟着主力资金大部队走"),
+        Factor(lambda d: d['ma_convergence'], 12, 1.0, "- 🌪️ **面临变盘**：短期和长期成本几乎重合，随时向上爆发"), 
         
-        Factor(lambda d: d['has_zt'], 10, 1.0, "🔥 【股性活跃】这只股历史上容易涨停，不会一潭死水"),
-        Factor(lambda d: d['vol_ratio'] >= 1.8, 10, 1.0, "🔵 【放量确认】今天成交量明显放大，大资金开始干活了"),
-        Factor(lambda d: d['red_days'] >= 2, 8, 1.0, "🔴 【稳步推升】最近重心都在上移，主力在偷偷温和建仓"),
+        Factor(lambda d: d['has_zt'], 10, 1.0, "- 🔥 **股性活跃**：该股历史上容易涨停，不会一潭死水"),
+        Factor(lambda d: d['vol_ratio'] >= 1.8, 10, 1.0, "- 🔵 **放量确认**：今天成交量明显放大，大资金开始干活了"),
+        Factor(lambda d: d['red_days'] >= 2, 8, 1.0, "- 🔴 **稳步推升**：最近重心都在上移，主力在偷偷温和建仓"),
         
-        Factor(lambda d: d['has_chip_break'], 15, tw, "🏔️ 【抛压真空】上方的套牢盘已割肉离场，向上拉升没阻力"),
-        Factor(lambda d: d['vcp_amp'] < 0.12, 10, 1.0, "🟣 【蓄势待发】近期上下波动极小，主力控盘很稳即将出方向"),
-        Factor(lambda d: d['extreme_shrink_vol'], 10, 1.0, "🧊 【没人砸盘】爆发前夕成交量极度萎缩，散户该卖的都卖了"), 
-        Factor(lambda d: d['has_obv_break'], 10, tw, "💸 【真金白银】模型监控到真实的资金在创纪录买入"),
-        Factor(lambda d: d['has_pullback'], 15, 1.0, "🪃 【上车机会】温和缩量回踩洗盘，主力挖坑给出的上车机会"),
-        Factor(lambda d: d['lower_shadow_ratio'] > 0.03, 8, 1.0, "📌 【强力护盘】跌下去被大资金迅速买回，下方有人兜底"), 
+        Factor(lambda d: d['has_chip_break'], 15, tw, "- 🏔️ **抛压真空**：上方的套牢盘已割肉离场，向上拉升没阻力"),
+        Factor(lambda d: d['vcp_amp'] < 0.12, 10, 1.0, "- 🟣 **蓄势待发**：近期波动极小，主力控盘很稳即将出方向"),
+        Factor(lambda d: d['extreme_shrink_vol'], 10, 1.0, "- 🧊 **没人砸盘**：爆发前夕成交极度萎缩，散户该卖的都卖了"), 
+        Factor(lambda d: d['has_obv_break'], 10, tw, "- 💸 **真金白银**：模型监控到真实的资金在创纪录净流入"),
+        Factor(lambda d: d['has_pullback'], 15, 1.0, "- 🪃 **黄金深坑**：出现温和缩量回踩，主力洗盘给出的上车良机"),
+        Factor(lambda d: d['lower_shadow_ratio'] > 0.03, 8, 1.0, "- 📌 **强力护盘**：跌下去被大资金迅速买回，下方有人兜底"), 
         
-        Factor(lambda d: d.get('rs_rating', 0) > 5,  8, 1.0, "🏆 【跑赢大盘】近60日涨幅超越指数，说明有资金在持续选择它"),
+        Factor(lambda d: d.get('rs_rating', 0) > 5,  8, 1.0, "- 🏆 **跑赢大盘**：近60日涨幅超越指数，有资金在持续运作"),
         
         # --- 【排雷扣分项】 ---
-        Factor(lambda d: d.get('consecutive_down', 0) >= 4, -15, 1.0, "🔪 【飞刀预警】近期出现连续阴线急跌，左侧接飞刀风险极大(已重度扣分)"),
-        Factor(lambda d: d.get('rsi', 50) > 80, -10, 1.0, "🌡️ 【微过热】RSI偏高，短线超买迹象，操作需要更小的仓位"),
-        Factor(lambda d: d.get('rs_rating', 0) < -10, -8, 1.0, "📉 【跑输大盘】近期持续弱于大盘，跟的是被市场冷落的股票"),
-        Factor(lambda d: d['has_consecutive_zt'] and d['price_pct'] < 0.40, 10, 1.0, "🔥🔥 【低位连板】刚刚启动的龙头，安全且辨识度高"),
-        # 【微调惩罚】：仅当价格分位极高 (>=0.90) 且连板时才扣除 15 分，不过度恐吓强势龙头股
-        Factor(lambda d: d['has_consecutive_zt'] and d['price_pct'] >= 0.90, -15, 1.0, "⚠️ 【高位接盘】股价已被炒高连板，千万别追，容易接盘！"),
-        Factor(lambda d: d['upper_shadow_pct'] > 18, -15, 1.0, "⚠️ 【诱多预警】冲高后大幅跳水，上方抛压极重，别上当"),
-        # 【微调惩罚】：放宽短期均线乖离偏离度的容忍范围（>25%才重罚）
-        Factor(lambda d: d['dist_ma20'] > 25, -15, 1.0, "🚫 【追高预警】目前涨得太急离均线太远，随时面临暴跌回调"),
+        Factor(lambda d: d.get('consecutive_down', 0) >= 4, -15, 1.0, "- 🔪 **飞刀预警**：近期连续阴线急跌，左侧接飞刀风险大 (重度扣分)"),
+        Factor(lambda d: d.get('rsi', 50) > 80, -10, 1.0, "- 🌡️ **短期过热**：RSI偏高短线超买，操作需要进一步缩减仓位"),
+        Factor(lambda d: d.get('rs_rating', 0) < -10, -8, 1.0, "- 📉 **跑输大盘**：近期持续弱于大盘，跟的是被冷落的股票"),
+        Factor(lambda d: d['has_consecutive_zt'] and d['price_pct'] < 0.40, 10, 1.0, "- 🔥 **低位连板**：刚刚启动的龙头，安全且市场辨识度极高"),
+        Factor(lambda d: d['has_consecutive_zt'] and d['price_pct'] >= 0.90, -15, 1.0, "- ⚠️ **高位接盘**：股价已被炒高连板，千万别追容易接盘！"),
+        Factor(lambda d: d['upper_shadow_pct'] > 18, -15, 1.0, "- ⚠️ **诱多预警**：冲高后大幅跳水，上方抛压极重别上当！"),
+        Factor(lambda d: d['dist_ma20'] > 25, -15, 1.0, "- 🚫 **追高预警**：目前涨得太急离均线太远，随时面临暴跌回调"),
         
-        Factor(lambda d: in_danger and d['mcap'] < 100e8, -8, 1.0, f"📅 【财报防守】当前属于{danger_label}高危期，小盘股需防业绩变脸(已扣分)")
+        Factor(lambda d: in_danger and d['mcap'] < 100e8, -8, 1.0, f"- 📅 **财报防雷**：当前属于{danger_label}，小盘股需防业绩变脸 (扣分)")
     ]
 
     score, reasons = 55, [meta] if meta else []
@@ -510,13 +501,13 @@ def apply_scoring(data: dict, now: datetime) -> tuple[int, str, str]:
     score = max(0, min(score, 100))
     
     if score >= 85:
-        level = '⭐⭐⭐⭐⭐ 🐯 [S级·老虎机模式] (胜率极高、跌势有限，最适合盲挂限价建仓)'
+        level = '⭐⭐⭐⭐⭐ 🐯 **[S级·老虎机]** (胜率极高，跌势有限)'
     elif score >= 75:
-        level = '⭐⭐⭐⭐ 🐕 [A级·看门狗模式] (稳健防守型，需要一点耐心慢慢等它涨)'
+        level = '⭐⭐⭐⭐ 🐕 **[A级·看门狗]** (防守兼备，需耐心等涨)'
     elif score >= 70:
-        level = '⭐⭐⭐ 🦊 [B+级·狐狸模式] (次优机会，胜率尚可，但务必严格控制仓位)'
+        level = '⭐⭐⭐ 🦊 **[B+级·小狐狸]** (次优机会，必须控制仓位)'
     else:
-        level = '⭐⭐ 🐒 [B级·猴子模式] (上蹿下跳振幅大，需要老手盯盘，纯新手请回避)'
+        level = '⭐⭐ 🐒 **[B级·小猕猴]** (上蹿下跳振幅大，新手回避)'
         
     return score, level, '\n'.join(reasons)
 
@@ -529,7 +520,6 @@ def is_valid_run_time(now: datetime) -> bool:
     return t >= 1505
 
 def process_stock(row: pd.Series, raw_hist: pd.DataFrame, now: datetime, market_ok: bool, index_ret: float) -> Optional[tuple]:
-    # 【致命杀手移除】：将历史 K 线要求从严苛的 250 根（1年）放宽至 120 根（约半年），彻底解救次新活跃科技股
     if len(raw_hist) < 120: return None
     
     hist = raw_hist.copy()
@@ -560,7 +550,6 @@ def process_stock(row: pd.Series, raw_hist: pd.DataFrame, now: datetime, market_
     stop = max(valid_supports + [row[C.S_PRICE] * 0.88]) * 0.993 
     risk_pct = ((row[C.S_PRICE] - stop) / row[C.S_PRICE]) * 100 if row[C.S_PRICE] > 0 else 99
     
-    # 【放宽物理防线】：容忍度从 15% 提升至 25%，接纳高波动大牛股
     if risk_pct > 25.0: return None 
 
     return (data, stop, risk_pct) 
@@ -591,33 +580,35 @@ def extract_market_context(df_raw: pd.DataFrame, c_conf: Config) -> tuple[pd.Dat
         sentiment_addon = ""
         if zt_count > 150:
             market_overheated = True
-            sentiment_addon = "\n🚨🚨 **情绪极度过热熔断！**今日涨停数破百，市场陷入非理性狂欢。系统已自动【禁止推荐任何股票】，请管住手！"
+            sentiment_addon = "\n- 🚨 **情绪熔断**：今日涨停破百市场极度狂欢，系统禁止推荐个股防踩踏！"
         elif dt_count > 100:
-            sentiment_addon = "\n❄️ **情绪极度冰点！**今日百股跌停，恐慌盘已出尽，这里往往是黄金坑和绝佳防守反击位！"
+            sentiment_addon = "\n- ❄️ **情绪冰点**：今日百股跌停恐慌出尽，往往是极佳防守反击点！"
 
         breadth = up_count / (up_count + down_count) if (up_count + down_count) > 0 else 0.5
         advice = ""
         if market_overheated:
-            advice = "🛑 强制休息！系统已熔断今日的买入建议。懂休息的才是真正的高手。"
+            advice = "🛑 **强制空仓休息** (懂休息的才是真正的高手)"
         elif market_ok and breadth >= 0.6:
-            advice = "🔥 赚钱效应极佳 (建议仓位 60%-80%)，精选标的积极建仓。"
+            advice = "🔥 **积极做多** (建议仓位 60%-80%，把握主线标的)"
         elif market_ok and breadth < 0.6:
-            advice = "⚠️ 指数安全但个股分化 (建议仓位 40%-60%)，优选低位标的，不追高。"
+            advice = "⚠️ **轻仓试错** (建议仓位 40%-60%，指数安全但个股分化)"
         elif not market_ok and breadth <= 0.3:
-            advice = "🧊 情绪绝对冰点 (建议仓位 10%-20%)，系统性风险释放中，多看少动为主。"
+            advice = "🧊 **冰点防守** (建议仓位 10%-20%，系统性风险释放中)"
         else:
-            advice = "🛡️ 弱势震荡市 (建议仓位 20%-40%)，控制手管住回撤，非绝对低位不买。"
+            advice = "🛡️ **弱势震荡** (建议仓位 20%-40%，控制手管住回撤)"
 
         fallback_warning = ""
         if C.S_PE in df_raw.columns and (df_raw[C.S_PE] == -1.0).sum() > len(df_raw) * 0.9: 
-            fallback_warning = "\n\n⚠️ **【系统数据源降级警报】**\n今日自动切换至备用数据源。**基本面过滤(市盈率/量比等)暂时失效**，请自行排雷！"
+            fallback_warning = "\n\n> ⚠️ **数据源降级警报**\n> 东方财富接口异常，自动切至新浪备用源。市盈率等基本面过滤暂时失效，请自行排雷！"
 
+        # 【深度排版升级】：采用 H3 和 纯粹的 Markdown 列表排版大盘体检
         market_msg = (
-            f"🎯 **上证指数**: {cl.iloc[-1]:.2f} (今日 {pct:+.2f}%)\n"
-            f"📈 **技术趋势**: {'🟢 企稳于MA20生命线' if market_ok else '🔴 跌破MA20生命线'}\n"
-            f"💰 **两市量能**: 约 {total_amt:.0f} 亿元\n"
-            f"🌡️ **市场情绪**: 上涨 {up_count} 家 / 下跌 {down_count} 家 (涨停 {zt_count} / 跌停 {dt_count}){sentiment_addon}\n"
-            f"💡 **总体仓位建议**: {advice}{fallback_warning}"
+            f"### 📊 大盘深度体检\n"
+            f"- **上证指数**：`{cl.iloc[-1]:.2f}` (今日 **{pct:+.2f}%**)\n"
+            f"- **技术趋势**：{'🟢 企稳于 **MA20** 生命线' if market_ok else '🔴 跌破 **MA20** 生命线'}\n"
+            f"- **两市量能**：约 `{total_amt:.0f}` 亿元\n"
+            f"- **市场情绪**：红盘 `{up_count}` 家 / 绿盘 `{down_count}` 家 (涨停 `{zt_count}` / 跌停 `{dt_count}`){sentiment_addon}\n\n"
+            f"**💡 仓位建议**：{advice}{fallback_warning}"
         )
     except Exception as e:
         log.warning(f"宏观状态解析失败: {e}")
@@ -688,7 +679,6 @@ def get_signals() -> tuple[list[Signal], list, set, int, str, int]:
     futures = {ex2.submit(fetch_hist, r[C.S_CODE], start_s, end_s): r for _, r in pool.iterrows()}
     
     try:
-        # 【通信稳定性升级】：移除单条数据的强行5秒超时限制，防止因API偶发卡顿造成静默丢失，并通过 log 打印异常明细
         for f in as_completed(futures, timeout=240): 
             row = futures[f]
             try:
@@ -744,12 +734,13 @@ def send_dingtalk(signals: list[Signal], watchlist: list, total_pool: int, total
     now_str = now_ts.strftime('%Y-%m-%d %H:%M')
     run_mode = os.environ.get('RUN_MODE', 'normal')
     
-    header = f"# 🤖 AI量化保姆级盘后总结\n> **{now_str}**\n\n"
+    # 【顶级排版设计】：H2 标题 + Blockquote 时间标注
+    header = f"## 🤖 AI量化保姆级盘后总结\n> **{now_str}**\n\n"
     if run_mode == 'market_only':
-        header = f"# 🤖 AI量化大盘深度体检\n> **{now_str}**\n\n"
+        header = f"## 🤖 AI量化大盘深度体检\n> **{now_str}**\n\n"
     elif run_mode != 'market_only' and total_market > 0:
         pass_rate = len(signals) / max(total_pool, 1) * 100 if total_pool > 0 else 0
-        header += f"**🔬 严苛雷达**：核心股扫描 {total_market} 只，异动决选 {total_pool} 只，安全通过 {len(signals)} 只 (B+级以上优选率 {pass_rate:.1f}%)\n\n"
+        header += f"**🔬 漏斗数据**：全市场白名单 `{total_market}` 只，异动提取 `{total_pool}` 只，完美过线 `{len(signals)}` 只 (B+级以上优选率 **{pass_rate:.1f}%**)\n\n"
         
     if market_msg:
         header += f"{market_msg}\n\n---\n\n"
@@ -760,7 +751,7 @@ def send_dingtalk(signals: list[Signal], watchlist: list, total_pool: int, total
         content = header + "⚠️ 今日部分个股数据扫描因接口受限中断，已为您提供核心大盘分析参考。"
     elif not signals and not watchlist:
         if not PUSH_EMPTY: return
-        content = f"{header}✅ 安全雷达体检未发现完全符合安全边际的优质股，别乱买，我们空仓防守！"
+        content = f"{header}✅ **机器体检结果**：今日未发现形态完全符合安全边际的标的，别乱买，建议**空仓防守**！"
     else:
         if signals:
             MAX_DISPLAY = 5
@@ -768,73 +759,73 @@ def send_dingtalk(signals: list[Signal], watchlist: list, total_pool: int, total
             hidden_count = len(signals) - len(display_signals)
             
             avg_score = sum(s.score for s in display_signals) / len(display_signals)
-            quality_tag = "🥇 信号质量优秀，可按剧本布局" if avg_score >= 80 \
-                else "🥈 信号质量尚可，需严格限价且减半仓位"
+            quality_tag = "🥇 **绝佳** (建议严格按剧本执行)" if avg_score >= 80 \
+                else "🥈 **尚可** (建议严格限价，减半仓位)"
                 
-            content = header + f"### 📈 今日正式推送质量自检\n**核心精选平均 {avg_score:.0f} 分 | {quality_tag}**\n\n"
+            content = header + f"### 📈 今日核心精选 (Top 5)\n**精选均分：{avg_score:.0f} 分** | {quality_tag}\n\n"
             
             cold_gate = (
-                "> ⏸️ ━━━━━━━━━━━━━━━━━━━━\n"
-                "> 📖 **买入前，请先做完这个自检（30秒）：**\n"
-                "> 1. 我这笔钱3年内不会急用？\n"
-                "> 2. 就算亏掉30%，我也不会睡不着觉？\n"
-                "> 3. 我不会因为这只股跌了就反复刷手机？\n>\n"
-                "> ✅ 三项全对 → 可以按计划操作\n"
-                "> ❌ 有一项不对 → 把计划买入金额砍掉一半，再看\n"
-                "> ━━━━━━━━━━━━━━━━━━━━\n\n"
+                "> **🛑 买入前冷静自检（30秒）**\n"
+                "> 1. 这笔闲钱 **3年内** 绝对不会急用？\n"
+                "> 2. 就算不小心 **亏掉30%** 也不会睡不着？\n"
+                "> 3. 能管住手，**绝不因为下跌反复盯盘**？\n"
+                "> \n"
+                "> *✅ 三项全对 ➡️ 允许按下方计划执行*\n"
+                "> *❌ 有一项不对 ➡️ 请立即把买入预算砍掉一半！*\n\n"
+                "---\n\n"
             )
             content += cold_gate
             
             parts = []
             for s in display_signals:
-                warn_msg = "⚡ **【风险警示】**：该股为创业板(波动±20%)，心脏不好的务必把买入金额砍半！\n\n" if str(s.code).startswith('300') else ""
+                warn_msg = "> ⚡ **【风险警示】** 该股为创业板(波动±20%)，心脏不好请务必**缩减仓位**！\n\n" if str(s.code).startswith('300') else ""
                 prefix = '1' if str(s.code).startswith('6') else '0'
-                tdx_market = 'SH' if str(s.code).startswith('6') else 'SZ' 
                 
                 sina_market = 'sh' if str(s.code).startswith('6') else 'sz'
                 kline_url = f"http://image.sinajs.cn/newchart/weekly/n/{sina_market}{s.code}.gif"
                 
+                # 嵌套 H4 标题，让股票名称极其醒目
                 parts.append(
-                    f"## 【{s.name} ({s.code})】\n"
+                    f"#### 🎯 {s.name} (`{s.code}`)\n"
                     f"{warn_msg}"
-                    f"- **触发时间**：{s.trigger_time}\n"
-                    f"- **综合评级**：{s.score}分 {s.level}\n"
-                    f"- **今日收盘**：¥{s.price} ({s.pct_chg})\n\n"
+                    f"- **综合评级**：`{s.score}` 分 {s.level}\n"
+                    f"- **今日收盘**：`¥{s.price}` ({s.pct_chg})\n\n"
                     f"![大周期周K线图]({kline_url})\n\n"
                     f"**💡 为什么机器选出它？**\n{s.reasons}\n\n"
-                    f"**🛡️ 小白专属次日操作剧本**\n"
-                    f"{s.hold_period_msg}\n\n"
+                    f"**🛡️ 小白专属操作剧本**\n"
+                    f"{s.hold_period_msg}\n"
                     f"{s.money_risk_msg}\n\n"
                     f"{s.tranche_plan_msg}\n\n"
                     f"{s.plan_b_msg}\n\n"
-                    f"🎯 **铁血移动止盈**：赚钱后如果收盘跌破 ¥{s.ma10} (10日线)，别犹豫，立刻卖出一半保住利润！\n\n"
-                    f"🚫 **次日防守纪律**：如果明天开盘直接高开超过 4%，说明有人抢跑，请直接放弃，绝不追高！\n\n"
-                    f"🔗 [点击跳转东方财富看盘](https://quote.eastmoney.com/unify/r/{prefix}.{s.code})\n\n"
-                    f"🔗 通达信快捷看盘：复制代码 `{s.code}` 后直接打开通达信App即可弹出\n"
+                    f"> **纪律红线**\n"
+                    f"> 🎯 **止盈**：收盘跌破 `¥{s.ma10}` (10日线)，立刻卖出一半保住利润！\n"
+                    f"> 🚫 **防守**：明日开盘直接高开 **> 4%** 说明资金抢跑，直接放弃，绝不追高！\n\n"
+                    f"[🔗 点击跳转东方财富 App 查阅详情](https://quote.eastmoney.com/unify/r/{prefix}.{s.code})\n\n"
+                    f"*📌 通达信看盘助手：复制代码 `{s.code}` 后打开通达信 App 即可弹出*"
                 )
-            content += "\n---\n".join(parts)
+            content += "\n\n---\n\n".join(parts)
             
             if hidden_count > 0:
-                content += f"\n\n---\n*⚠️ 受限于钉钉单条消息的字数上限，本次还有 **{hidden_count} 只** 达标个股已被系统自动折叠。请优先关注上方排名前列的核心标的！*"
+                content += f"\n\n---\n*⚠️ 受限于钉钉超长文本截断机制，本次还有 **{hidden_count} 只** 达标个股已被系统自动隐藏。请优先关注上方排名前列的核心标的！*"
                 
         else:
             content = header + "✅ 今日未发现 B+ 级以上核心机会，正式推荐列表空仓防守中。\n"
 
         if watchlist:
             watch_lines = "\n".join(
-                f"- `{code}` **{name}** (¥{price}) 得分: **{score}分**"
+                f"- `{code}` **{name}** (¥{price}) 得分: **{score}**"
                 for name, code, score, price in watchlist[:5]
             )
             content += (
-                f"\n\n---\n### 👁️ 候补观察池（看看就好，手别动）\n"
+                f"\n\n---\n### 👁️ 候补观察池（只看不买）\n"
                 f"{watch_lines}\n\n"
-                f"*以上标的当前评级不足 70 分，系统判断波动或风险偏大，暂不提供操作剧本。仅作盘感追踪，待其评级升至发车线后再考虑介入。*"
+                f"*注：以上标的评级不足 70 分，系统判断波动或风险偏大，暂不提供操作剧本。待其评级升至发车线后再考虑介入。*"
             )
         
         content += (
-            "\n\n---\n**🤔 买入前灵魂拷问：**\n"
-            "如果明天买入的股票跌了 5%，我会焦虑得睡不着觉吗？\n"
-            "**→ 如果会，请把你准备买入的金额【再砍掉一半】！投资是为了生活更好，不是为了找罪受。**"
+            "\n\n---\n### 🤔 每日灵魂拷问\n"
+            "如果明天买入的股票跌了 5%，我会焦虑得睡不着觉吗？\n\n"
+            "> **如果会，请把你准备买入的金额【再砍掉一半】！投资是为了生活更好，不是花钱找罪受。**"
         )
 
     try:

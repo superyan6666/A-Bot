@@ -406,10 +406,11 @@ class AShareTechnicals:
             if df[C.H_CLOSE].iloc[-i] > df[C.H_OPEN].iloc[-i]: red_days += 1
             else: break
             
+        # 【致命修正】：将原来荒谬的 100倍 量级差距 (-0.05) 修正为正确的百分点比值 (-5.0)
         has_pullback = bool(
             today[C.H_CLOSE] >= today['MA20'] and 
             today[C.H_VOL] < today['MA5_V'] * 0.9 and
-            -0.05 <= df['PCT_CHG'].iloc[-1] <= 0.02
+            -5.0 <= df['PCT_CHG'].iloc[-1] <= 2.0
         )
 
         return {
@@ -452,6 +453,7 @@ def apply_scoring(data: dict, now: datetime) -> tuple[int, str, str]:
 
     in_danger, danger_label = is_earnings_danger_zone(now)
 
+    # 【深度清理】：已彻底铲除 Sector 板块相关的幽灵因子代码
     factors = [
         Factor(lambda d: d['mcap'] > 300e8 and 0 < d['pe'] < 25 and d['pb'] < 3, 12, 1.0, "🏢 【价值蓝筹】大市值低估值核心资产，防守属性极强"),
         Factor(lambda d: str(d.get('code', '')).startswith('300') and d['vol_ratio'] > 1.2 and d['rs_rating'] > 5, 12, 1.0, "🚀 【弹性成长】创业板高弹性成长标的，接力意愿强"),
@@ -649,17 +651,19 @@ def get_signals() -> tuple[list[Signal], list, set, int, str, int]:
     if df_clean.empty:
         return [], [], pushed, 0, m_msg, 0
 
-    # 【新增】：强制核心资产过滤锁（剔除全市场垃圾股的随机干扰）
     core_pool = fetch_core_pool()
     if core_pool:
         df_clean = df_clean[df_clean[C.S_CODE].isin(core_pool)]
         log.info(f"💎 已开启【核心优质股池】模式，限定扫描 {len(core_pool)} 只国家队核心及高弹性成分股。")
 
+    # 【致命修复】：接纳并放行所有备用源假数据（PE == -1.0），防止新浪源触发时全军覆没
+    pe_cond = (df_clean[C.S_PE] > c_conf.MIN_PE) | (df_clean[C.S_PE] == -1.0)
+    
     mask = (df_clean[C.S_PCT] >= c_conf.MIN_PCT_CHG) & \
            (df_clean[C.S_PRICE] <= c_conf.MAX_PRICE) & \
            (df_clean[C.S_MCAP].between(c_conf.MIN_CAP, c_conf.MAX_CAP)) & \
            (df_clean[C.S_TURN].between(c_conf.MIN_TURNOVER, c_conf.MAX_TURNOVER)) & \
-           (df_clean[C.S_PE] > c_conf.MIN_PE) & (df_clean[C.S_PE] <= c_conf.MAX_PE) & \
+           pe_cond & (df_clean[C.S_PE] <= c_conf.MAX_PE) & \
            (df_clean[C.S_PB] > 0) & (df_clean[C.S_PB] <= 10.0) & \
            (~df_clean[C.S_CODE].str.startswith(('688', '8', '4', '9'))) & \
            (df_clean[C.S_HIGH] > df_clean[C.S_LOW]) 
@@ -670,8 +674,6 @@ def get_signals() -> tuple[list[Signal], list, set, int, str, int]:
     pool = df_clean[mask].pipe(lambda d: d[~d[C.S_CODE].isin(pushed)]).copy()
     if pool.empty: return [], [], pushed, len(df_clean), m_msg, len(df_clean)
     
-    # 【逻辑优化】：将白名单扩容后，截断上限提升至 400，并改用“换手率(TURN)”排序！
-    # 抛弃按市值(MCAP)排序，否则中证1000和创业板的高弹性科技股永远排在四大行后面，拿不到出场机会。
     if len(pool) > 400:
         log.info(f"💡 触发防爆流截断，优先保留最活跃(高换手)的 400 只核心标的参与决选。")
         pool = pool.sort_values(by=C.S_TURN, ascending=False).head(400)
@@ -723,7 +725,6 @@ def get_signals() -> tuple[list[Signal], list, set, int, str, int]:
     finally:
         ex2.shutdown(wait=False, cancel_futures=True)
 
-    # 【绝对确定性排序】：分数为主，股票代码为辅，彻底消灭并发带来的同分股票随机乱序！
     confirmed_data.sort(key=lambda x: (x.score, x.code), reverse=True)
     watchlist_data.sort(key=lambda x: (x[2], x[1]), reverse=True) 
     return confirmed_data, watchlist_data, pushed, len(pool), m_msg, len(df_clean)

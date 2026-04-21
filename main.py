@@ -9,7 +9,6 @@ from functools import wraps
 from typing import Optional, Tuple, Callable
 
 import requests
-from requests.exceptions import RequestException
 import numpy as np
 import pandas as pd
 import pytz
@@ -97,16 +96,14 @@ class EnvParser:
 @dataclass(frozen=True)
 class Config:
     MIN_CAP: float       = field(default_factory=lambda: EnvParser.get_float('MIN_CAP', 30e8)) 
-    # 【放宽】：接纳核心资产蓝筹股，上限由 500亿 提升至 2000亿
     MAX_CAP: float       = field(default_factory=lambda: EnvParser.get_float('MAX_CAP', 2000e8))
     MAX_PRICE: float     = field(default_factory=lambda: EnvParser.get_float('MAX_PRICE', 60.0))  
     MIN_PE: float        = field(default_factory=lambda: EnvParser.get_float('MIN_PE', 0))    
-    # 【放宽】：接纳高估值科技成长股
     MAX_PE: float        = field(default_factory=lambda: EnvParser.get_float('MAX_PE', 300))      
-    # 【放宽】：接纳蓝筹股天然偏低的换手率
     MIN_TURNOVER: float  = field(default_factory=lambda: EnvParser.get_float('MIN_TURNOVER', 0.5))
     MAX_TURNOVER: float  = field(default_factory=lambda: EnvParser.get_float('MAX_TURNOVER', 25.0)) 
-    MIN_PCT_CHG: float   = field(default_factory=lambda: EnvParser.get_float('MIN_PCT_CHG', -1.0))  
+    # 【修复致命拦截】：容忍洗盘跌幅，由 -1.0% 放宽到 -4.0%，否则错杀所有洗盘良机
+    MIN_PCT_CHG: float   = field(default_factory=lambda: EnvParser.get_float('MIN_PCT_CHG', -4.0))  
     MIN_VOL_RATIO: float = field(default_factory=lambda: EnvParser.get_float('MIN_VOL_RATIO', 0.5))  
     MAX_VOL_RATIO: float = field(default_factory=lambda: EnvParser.get_float('MAX_VOL_RATIO', 15.0))
     
@@ -310,7 +307,7 @@ def fetch_spot() -> pd.DataFrame:
             fallback_defaults = {
                 C.S_TURN: 2.0,      
                 C.S_MCAP: 100e8,    
-                C.S_PE: 15.0,       
+                C.S_PE: -1.0,       # 【安全修复】：改为特殊的负数，防止垃圾股骗取8分业绩护体加分
                 C.S_PB: 2.0,        
                 C.S_VR: 1.0         
             }
@@ -329,7 +326,7 @@ class AShareTechnicals:
         close = self.df[C.H_CLOSE]
         high, low, vol = self.df[C.H_HIGH], self.df[C.H_LOW], self.df[C.H_VOL]
         
-        for span in (10, 20, 60, 250):
+        for span in (10, 20, 60):  # 【算力优化】：清理无效的 250日 年线遍历
             self.df[f'MA{span}'] = close.rolling(span).mean()
         self.df['MA5_V'] = vol.rolling(5).mean()
         self.df['MA20_V'] = vol.rolling(20).mean()
@@ -366,10 +363,10 @@ class AShareTechnicals:
         price_pct = (today[C.H_CLOSE] - min_1y) / rng
         
         if price_pct > 0.96: return None 
-
         if today[C.H_CLOSE] < today['MA20'] * 0.95: return None
         
-        if not (today['DIF'] >= today['DEA'] or today['DIF'] > -0.1): return None
+        # 【修复拦截】：放宽洗盘票的 MACD DIF 限制，由 > -0.1 改为 > -0.25，允许适当的深度回调
+        if not (today['DIF'] >= today['DEA'] or today['DIF'] > -0.25): return None
 
         rsi = float(today.get('RSI14', 50))
         if pd.isna(rsi) or rsi > 85: return None 
@@ -397,12 +394,11 @@ class AShareTechnicals:
             if df[C.H_CLOSE].iloc[-i] > df[C.H_OPEN].iloc[-i]: red_days += 1
             else: break
             
-        body_pct = (today[C.H_CLOSE] - today[C.H_OPEN]) / today[C.H_OPEN] if today[C.H_OPEN] > 0 else 0
+        # 【算力优化】：删除了不再被任何逻辑使用的 body_pct 变量
         has_pullback = bool(
-            yest[C.H_LOW] <= yest['MA20'] * 1.02 and 
-            today[C.H_CLOSE] > today['MA20'] and 
-            today[C.H_VOL] < today['MA5_V'] and
-            body_pct > -0.05
+            today[C.H_CLOSE] >= today['MA20'] and 
+            today[C.H_VOL] < today['MA5_V'] * 0.9 and
+            -0.05 <= df['PCT_CHG'].iloc[-1] <= 0.02
         )
 
         return {
@@ -446,7 +442,6 @@ def apply_scoring(data: dict, now: datetime) -> tuple[int, str, str]:
     in_danger, danger_label = is_earnings_danger_zone(now)
 
     factors = [
-        # ── 柔性风格适配（低成本多模态选股） ──
         Factor(lambda d: d['mcap'] > 300e8 and 0 < d['pe'] < 25 and d['pb'] < 3, 12, 1.0, "🏢 【价值蓝筹】大市值低估值核心资产，防守属性极强"),
         Factor(lambda d: str(d.get('code', '')).startswith('300') and d['vol_ratio'] > 1.2 and d['rs_rating'] > 5, 12, 1.0, "🚀 【弹性成长】创业板高弹性或资金高低切标的，接力意愿强"),
         Factor(lambda d: d['price_pct'] < 0.3 and 0 < d['pb'] < 1.0, 10, 1.0, "♻️ 【困境反转】股价严重破净且处于绝对低位，安全垫极厚"),
@@ -462,7 +457,8 @@ def apply_scoring(data: dict, now: datetime) -> tuple[int, str, str]:
         Factor(lambda d: 6.0 < d['dist_ma20'] <= 12.0, 8, 1.0, "🚀 【强势上攻】距离20日线有一定空间，依托10日线强势上攻"),
         Factor(lambda d: d['dist_ma20'] < 0, -10, 1.0, "⚠️ 【破位嫌疑】当前处于20日线下方，属于弱势反弹，需警惕冲高回落"),
         
-        Factor(lambda d: 40 <= d.get('rsi', 50) <= 68, 10, 1.0, "📊 【温度适中】RSI处于健康买入区间，不冷不热正是下手时机"),
+        # 【扩容】：涵盖超卖反弹洗盘的情况 (35~68)
+        Factor(lambda d: 35 <= d.get('rsi', 50) <= 68, 10, 1.0, "📊 【温度适中】RSI处于健康买入区间，不冷不热正是下手时机"),
         
         Factor(lambda d: d['bull_rank'], 10, 1.0, "📈 【顺势而为】均线多头排列，跟着主力资金大部队走"),
         Factor(lambda d: d['ma_convergence'], 12, 1.0, "🌪️ 【面临变盘】短期和长期成本几乎重合，随时向上爆发"), 
@@ -537,7 +533,8 @@ def process_stock(row: pd.Series, raw_hist: pd.DataFrame, now: datetime, market_
         }])
         hist = pd.concat([hist, synthetic], ignore_index=True)
 
-    if hist.iloc[-1][C.H_CLOSE] <= hist.iloc[-1][C.H_OPEN] or hist.iloc[-1][C.H_VOL] <= 0: return None
+    # 【修复致命拦截】：删除了 C.H_CLOSE <= C.H_OPEN 的阴线无条件抹杀，允许阴线低吸！
+    if hist.iloc[-1][C.H_VOL] <= 0: return None
     
     engine = AShareTechnicals(hist)
     data = engine.get_features()
@@ -548,7 +545,6 @@ def process_stock(row: pd.Series, raw_hist: pd.DataFrame, now: datetime, market_
     data['mcap'] = float(row.get(C.S_MCAP, 0))
     data['vol_ratio'] = float(row.get(C.S_VR, 1.0))
     data['rs_rating'] = ((row[C.S_PRICE] / data['close_60d_ago'] - 1) * 100 - index_ret) if data['close_60d_ago'] > 0 else 0
-    # 存入code用于风格分类判定
     data['code'] = str(row[C.S_CODE])
     
     supports = [data['ma10_val'], data['ma20_val'], data['recent_20_low'], data['boll_lower']]
@@ -605,7 +601,7 @@ def extract_market_context(df_raw: pd.DataFrame, c_conf: Config) -> tuple[pd.Dat
             advice = "🛡️ 弱势震荡市 (建议仓位 20%-40%)，控制手管住回撤，非绝对低位不买。"
 
         fallback_warning = ""
-        if C.S_PE in df_raw.columns and (df_raw[C.S_PE] == 15.0).sum() > len(df_raw) * 0.9:
+        if C.S_PE in df_raw.columns and (df_raw[C.S_PE] == -1.0).sum() > len(df_raw) * 0.9:  # 【同步修复】：判定条件同步改为 -1.0
             fallback_warning = "\n\n⚠️ **【系统数据源降级警报】**\n今日自动切换至备用数据源。**基本面过滤(市盈率/量比等)暂时失效**，请自行排雷！"
 
         market_msg = (
@@ -631,7 +627,7 @@ def get_signals() -> tuple[list[Signal], list, set, int, str, int]:
     if not IS_MANUAL and not is_valid_run_time(now): 
         return [], [], set(), 0, "", 0
 
-    c_conf, pushed = load_pushed_state(), load_pushed_state() 
+    pushed = load_pushed_state() # 【修复笔误】：移除 c_conf 错误赋值
 
     try:
         df_raw = fetch_spot()
@@ -665,7 +661,8 @@ def get_signals() -> tuple[list[Signal], list, set, int, str, int]:
     if pool.empty: return [], [], pushed, len(df_clean), m_msg, len(df_clean)
     
     if len(pool) > 150:
-        ideal_mask = pool[C.S_PCT].between(-2.0, 6.0)
+        # 【扩容】：允许跌幅达到 -4.0% 的股票进入优选池，接纳洗盘动作！
+        ideal_mask = pool[C.S_PCT].between(-4.0, 6.0)
         if ideal_mask.sum() > 30:
             pool = pool[ideal_mask]
             
@@ -742,7 +739,6 @@ def send_dingtalk(signals: list[Signal], watchlist: list, total_pool: int, total
     now_str = now_ts.strftime('%Y-%m-%d %H:%M')
     run_mode = os.environ.get('RUN_MODE', 'normal')
     
-    # 【升级】：转用 Markdown 排版，支持标题、加粗和直接渲染图床图片
     header = f"# 🤖 AI量化保姆级盘后总结\n> **{now_str}**\n\n"
     if run_mode == 'market_only':
         header = f"# 🤖 AI量化大盘深度体检\n> **{now_str}**\n\n"
@@ -786,7 +782,6 @@ def send_dingtalk(signals: list[Signal], watchlist: list, total_pool: int, total
                 prefix = '1' if str(s.code).startswith('6') else '0'
                 tdx_market = 'SH' if str(s.code).startswith('6') else 'SZ' 
                 
-                # 【核心巧思】：直接拼接新浪财经的静态 GIF 图床地址 (weekly 代表周K，daily 代表日K)
                 sina_market = 'sh' if str(s.code).startswith('6') else 'sz'
                 kline_url = f"http://image.sinajs.cn/newchart/weekly/n/{sina_market}{s.code}.gif"
                 
@@ -830,7 +825,6 @@ def send_dingtalk(signals: list[Signal], watchlist: list, total_pool: int, total
         )
 
     try:
-        # 【关键修改】：将钉钉发送类型(msgtype)从 text 改为 markdown
         payload = {
             'msgtype': 'markdown',
             'markdown': {

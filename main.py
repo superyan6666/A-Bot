@@ -96,15 +96,16 @@ class EnvParser:
 
 @dataclass(frozen=True)
 class Config:
+    # --- 小白专属护城河参数 (已针对多头行情适度放宽) ---
     MIN_CAP: float       = field(default_factory=lambda: EnvParser.get_float('MIN_CAP', 30e8)) 
     MAX_CAP: float       = field(default_factory=lambda: EnvParser.get_float('MAX_CAP', 500e8))
     MAX_PRICE: float     = field(default_factory=lambda: EnvParser.get_float('MAX_PRICE', 60.0))  
     MIN_PE: float        = field(default_factory=lambda: EnvParser.get_float('MIN_PE', 0))    
-    MAX_PE: float        = field(default_factory=lambda: EnvParser.get_float('MAX_PE', 100))  
+    MAX_PE: float        = field(default_factory=lambda: EnvParser.get_float('MAX_PE', 200))       # 接纳高估值成长股
     MIN_TURNOVER: float  = field(default_factory=lambda: EnvParser.get_float('MIN_TURNOVER', 1.5))
     MAX_TURNOVER: float  = field(default_factory=lambda: EnvParser.get_float('MAX_TURNOVER', 15.0)) 
-    MIN_PCT_CHG: float   = field(default_factory=lambda: EnvParser.get_float('MIN_PCT_CHG', 1.5))
-    MIN_VOL_RATIO: float = field(default_factory=lambda: EnvParser.get_float('MIN_VOL_RATIO', 0.8)) 
+    MIN_PCT_CHG: float   = field(default_factory=lambda: EnvParser.get_float('MIN_PCT_CHG', 0.0))  # 允许平盘潜伏
+    MIN_VOL_RATIO: float = field(default_factory=lambda: EnvParser.get_float('MIN_VOL_RATIO', 0.6))  # 允许极致缩量洗盘
     MAX_VOL_RATIO: float = field(default_factory=lambda: EnvParser.get_float('MAX_VOL_RATIO', 10.0))
     
     REQUIRED_COLS: tuple = (C.S_PRICE, C.S_OPEN, C.S_HIGH, C.S_LOW, C.S_VOL, C.S_AMT, 
@@ -196,7 +197,7 @@ def generate_tranche_plan(price: float, score: int, market_ok: bool, market_over
     if market_overheated:
         return "🛑 **【系统熔断】当前市场情绪极度过热，随时面临收割踩踏！系统强制禁止明日建仓，请管住手！**"
         
-    base_pct = 30 if score >= 85 else 20 if score >= 75 else 10
+    base_pct = 30 if score >= 85 else 20 if score >= 70 else 10
     if not market_ok:
         base_pct = base_pct // 2
         
@@ -367,7 +368,8 @@ class AShareTechnicals:
         if not (today['DIF'] >= today['DEA'] or today['DIF'] > -0.1): return None
 
         rsi = float(today.get('RSI14', 50))
-        if pd.isna(rsi) or rsi > 75: return None 
+        # 【限制放宽】强势票经常在高位钝化，RSI上限由75放宽至82
+        if pd.isna(rsi) or rsi > 82: return None 
 
         consecutive_down = 0
         for i in range(2, 8):
@@ -375,7 +377,6 @@ class AShareTechnicals:
                 consecutive_down += 1
             else:
                 break
-        if consecutive_down >= 4: return None
 
         ma_convergence = (abs(today['MA10'] - today['MA20']) / today['MA20'] < 0.03) and \
                          (abs(today['MA20'] - today['MA60']) / today['MA60'] < 0.05)
@@ -417,6 +418,7 @@ class AShareTechnicals:
             'dist_ma20': (today[C.H_CLOSE] / today['MA20'] - 1) * 100,
             'red_days': red_days,
             'rsi': rsi,
+            'consecutive_down': consecutive_down,
             'macd_dea': float(today['DEA']),
             'ma10_val': float(today['MA10']), 'ma20_val': float(today['MA20']), 'atr_val': float(today['ATR']),
             'low_val': float(today[C.H_LOW]), 'recent_20_low': float(df[C.H_LOW].iloc[-20:].min()),
@@ -464,13 +466,15 @@ def apply_scoring(data: dict, now: datetime) -> tuple[int, str, str]:
         Factor(lambda d: d['has_pullback'], 15, 1.0, "🪃 【上车机会】温和缩量回踩，主力洗盘挖坑给的上车机会"),
         Factor(lambda d: d['lower_shadow_ratio'] > 0.03, 8, 1.0, "📌 【强力护盘】跌下去被大资金迅速买回，下方有人兜底"), 
         
-        Factor(lambda d: d.get('sector_ok', False), 10, 1.0, "🌱 【板块温和】所属板块今日温和上涨，资金在悄悄布局而非疯狂追涨"),
+        Factor(lambda d: d.get('sector_ok', False), 10, 1.0, "🌱 【板块温温】所属板块今日温和上涨，资金在悄悄布局而非疯狂追涨"),
         Factor(lambda d: 0.0 <= d.get('sector_pct', 0) <= 0.3, 5, 1.0, "⚖️ 【独立行情】所属板块表现平淡，全靠个股自身逻辑独立走强"),
         Factor(lambda d: 3.0 <= d.get('sector_pct', 0) < 5.0, 5, 1.0, "📈 【板块较热】板块涨幅较大，已吸引市场目光，可顺势参与但需防回调"),
         
         Factor(lambda d: d.get('rs_rating', 0) > 5,  8, 1.0, "🏆 【跑赢大盘】近60日涨幅超越指数，说明有资金在持续选择它"),
         
         # --- 【排雷扣分项】 ---
+        # 【优化】：连跌飞刀不再一刀切物理拦截，而是给予重度扣分，若其他优势极其突出仍可保留入选机会
+        Factor(lambda d: d.get('consecutive_down', 0) >= 4, -15, 1.0, "🔪 【飞刀预警】近期出现连续阴线急跌，哪怕有反弹也是左侧接飞刀，风险极大(已重度扣分)"),
         Factor(lambda d: d.get('sector_overheated', False), -12, 1.0, "🌋 【板块过热】今日板块暴涨超5%，主力随时借机出货，小白此时入场风险极高(已扣分)"),
         Factor(lambda d: d.get('rsi', 50) > 68, -10, 1.0, "🌡️ 【微过热】RSI偏高，短线超买迹象，操作需要更小的仓位"),
         Factor(lambda d: d.get('rs_rating', 0) < -10, -8, 1.0, "📉 【跑输大盘】近期持续弱于大盘，跟的是被市场冷落的股票"),
@@ -491,12 +495,15 @@ def apply_scoring(data: dict, now: datetime) -> tuple[int, str, str]:
 
     score = max(0, min(score, 100))
     
+    # 【放宽推送门槛】：增加了 B+级 狐狸模式
     if score >= 85:
         level = '⭐⭐⭐⭐⭐ 🐯 [S级·老虎机模式] (胜率极高、跌势有限，最适合盲挂限价建仓)'
     elif score >= 75:
         level = '⭐⭐⭐⭐ 🐕 [A级·看门狗模式] (稳健防守型，需要一点耐心慢慢等它涨)'
+    elif score >= 70:
+        level = '⭐⭐⭐ 🦊 [B+级·狐狸模式] (次优机会，胜率尚可，但务必严格控制仓位)'
     else:
-        level = '⭐⭐⭐ 🐒 [B级·猴子模式] (上蹿下跳振幅大，需要老手盯盘，纯新手请回避)'
+        level = '⭐⭐ 🐒 [B级·猴子模式] (上蹿下跳振幅大，需要老手盯盘，纯新手请回避)'
         
     return score, level, '\n'.join(reasons)
 
@@ -611,16 +618,14 @@ def get_signals() -> tuple[list[Signal], list, set, int, str, int]:
     if not IS_MANUAL and not is_valid_run_time(now): 
         return [], [], set(), 0, "", 0
 
-    c_conf, pushed = load_pushed_state(), load_pushed_state() # 初始化配置
+    c_conf, pushed = load_pushed_state(), load_pushed_state() 
 
     try:
-        # 直接拉取横截面数据，极速获取，无视并发封锁
         df_raw = fetch_spot()
     except Exception as e:
         log.error(f"❌ 核心横截面行情获取失败: {e}")
         return [], [], pushed, 0, f"⚠️ **行情接口异常，体检中断**: {e}", 0
 
-    # 大盘基准测算（不依赖额外网络请求，安全且快）
     c_conf = Config()
     df_clean, m_ok, m_msg, idx_ret, m_overheated = extract_market_context(df_raw, c_conf)
 
@@ -646,8 +651,6 @@ def get_signals() -> tuple[list[Signal], list, set, int, str, int]:
     pool = df_clean[mask].pipe(lambda d: d[~d[C.S_CODE].isin(pushed)]).copy()
     if pool.empty: return [], [], pushed, len(df_clean), m_msg, len(df_clean)
     
-    # ── 牛市保险栓：防止候选股票过多导致永远跑不完从而触发超时 ──
-    # 将按照成交额活跃度排序，只提取前 80 只最活跃的个股进行测算
     if len(pool) > 80:
         log.info(f"💡 今日满足初筛的个股多达 {len(pool)} 只，触发防爆流截断，仅保留活跃度前 80 的标的。")
         pool = pool.sort_values(by=C.S_AMT, ascending=False).head(80)
@@ -657,12 +660,10 @@ def get_signals() -> tuple[list[Signal], list, set, int, str, int]:
     
     end_s, start_s = now.strftime('%Y%m%d'), (now - timedelta(days=450)).strftime('%Y%m%d')
     
-    # 将并发数稳稳锁在 4，绝不踩东方财富的红线
     ex2 = ThreadPoolExecutor(max_workers=4)
     futures = {ex2.submit(fetch_hist, r[C.S_CODE], start_s, end_s): r for _, r in pool.iterrows()}
     
     try:
-        # 设定单股最大等待超时，保证在限定时间内全部吐出
         for f in as_completed(futures, timeout=150): 
             row = futures[f]
             try:
@@ -670,10 +671,19 @@ def get_signals() -> tuple[list[Signal], list, set, int, str, int]:
                 result = process_stock(row, hist, now, m_ok, idx_ret)
                 if result:
                     data, stop, risk = result
+                    sector = fetch_stock_sector(row[C.S_CODE])
+                    s_pct = sec_strengths.get(sector, 0.0) if 'sec_strengths' in locals() else 0.0
+                    data.update({
+                        'sector': sector, 
+                        'sector_pct': s_pct, 
+                        'sector_ok': (0.3 < s_pct < 3.0),
+                        'sector_overheated': (s_pct >= 5.0)
+                    })
                     
                     score, level, reas = apply_scoring(data, now)
                     
-                    if score >= 75: 
+                    # 【降低发车门槛】：70分以上即可发车，容纳 B+ 级别信号
+                    if score >= 70: 
                         target1_price = round(row[C.S_PRICE]*(1+risk*2.5/100), 2)
                         
                         money_msg = format_money_risk_msg(row[C.S_PRICE], stop, target1_price)
@@ -687,11 +697,12 @@ def get_signals() -> tuple[list[Signal], list, set, int, str, int]:
                             trigger_time=now.strftime('%H:%M'), reasons=reas,
                             stop_loss=round(stop, 2), target1=target1_price,
                             ma10=round(data['ma10_val'], 2),
+                            sector=sector, sector_pct=s_pct,
                             money_risk_msg=money_msg, tranche_plan_msg=tranche_msg,
                             plan_b_msg=plan_b_msg, hold_period_msg=hold_msg
                         ))
                         pushed.add(row[C.S_CODE]) 
-                    elif score >= 65:
+                    elif score >= 60:  # 观察池门槛相应降低至 60 分
                         watchlist_data.append((row[C.S_NAME], row[C.S_CODE], score, row[C.S_PRICE]))
                         
             except Exception:
@@ -722,7 +733,7 @@ def send_dingtalk(signals: list[Signal], watchlist: list, total_pool: int, total
         header = f"🤖 AI量化提醒：盘后大盘深度体检 {now_str}\n"
     elif run_mode != 'market_only' and total_market > 0:
         pass_rate = len(signals) / max(total_pool, 1) * 100 if total_pool > 0 else 0
-        header += f"\n🔬 严苛雷达：全市场扫描 {total_market} 只个股，异动 {total_pool} 只，安全通过 {len(signals)} 只 (A级以上通过率 {pass_rate:.1f}%)\n"
+        header += f"\n🔬 严苛雷达：全市场扫描 {total_market} 只个股，异动 {total_pool} 只，安全通过 {len(signals)} 只 (B+级以上通过率 {pass_rate:.1f}%)\n"
         
     if market_msg:
         header += f"\n{market_msg}\n\n"
@@ -738,7 +749,7 @@ def send_dingtalk(signals: list[Signal], watchlist: list, total_pool: int, total
         if signals:
             avg_score = sum(s.score for s in signals) / len(signals)
             quality_tag = "🥇 信号质量优秀，可按剧本布局" if avg_score >= 80 \
-                else "🥈 信号质量一般，需严格限价且减半仓位"
+                else "🥈 信号质量尚可，需严格限价且减半仓位"
                 
             content = header + f"📈 **今日正式推送质量自检**：平均 {avg_score:.0f} 分 | {quality_tag}\n\n"
             
@@ -779,7 +790,7 @@ def send_dingtalk(signals: list[Signal], watchlist: list, total_pool: int, total
                 )
             content += "\n".join(parts)
         else:
-            content = header + "✅ 今日未发现 A 级以上稳健信号，正式推荐列表空仓防守中。\n"
+            content = header + "✅ 今日未发现 B+ 级以上机会，正式推荐列表空仓防守中。\n"
 
         if watchlist:
             watch_lines = "\n".join(
@@ -789,7 +800,7 @@ def send_dingtalk(signals: list[Signal], watchlist: list, total_pool: int, total
             content += (
                 f"\n\n👁️ **候补观察池（看看就好，手别动）**\n"
                 f"{watch_lines}\n"
-                f"以上标的当前评级为 B 级，系统判断波动或风险偏大，暂不提供操作剧本。仅作盘感追踪，待其评级升至 A 级后再考虑介入。"
+                f"以上标的当前评级不足 70 分，系统判断波动或风险偏大，暂不提供操作剧本。仅作盘感追踪，待其评级升至发车线后再考虑介入。"
             )
         
         content += (

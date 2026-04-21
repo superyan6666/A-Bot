@@ -435,7 +435,7 @@ class AShareTechnicals:
         if not (today['DIF'] >= today['DEA'] or today['DIF'] > -0.1): return None
 
         rsi = float(today.get('RSI14', 50))
-        if pd.isna(rsi) or rsi > 75: return None # RSI严重超买，今天进去大概率站岗
+        if pd.isna(rsi) or rsi > 75: return None 
 
         consecutive_down = 0
         for i in range(2, 8):
@@ -675,6 +675,10 @@ def extract_market_context(df_raw: pd.DataFrame, c_conf: Config) -> tuple[pd.Dat
         else:
             advice = "🛡️ 弱势震荡市 (建议仓位 20%-40%)，控制手管住回撤，非绝对低位不买。"
 
+        fallback_warning = ""
+        if C.S_PE in df_raw.columns and (df_raw[C.S_PE] == 15.0).sum() > len(df_raw) * 0.9:
+            fallback_warning = "\n\n⚠️ **【系统数据源降级警报】**\n由于主数据源网络拥堵，今日自动切换至备用数据源。**基本面过滤(市盈率/市净率/量比等)暂时失效**，请自行检查个股是否亏损或带雷！"
+
         market_msg = (
             f"🎯 **指数收盘态势**:\n"
             f"   • 上证指数: {cl.iloc[-1]:.2f} ({sh_pct:+.2f}%)\n"
@@ -685,10 +689,7 @@ def extract_market_context(df_raw: pd.DataFrame, c_conf: Config) -> tuple[pd.Dat
             f"   • 趋势: {'🟢 企稳于MA20生命线' if market_ok else '🔴 跌破MA20生命线'}，大级别呈{trend_status}。\n"
             f"   • 动能: MACD{macd_status}，短期呈现{amt_status}{'反弹' if sh_pct > 0 else '调整'}。\n"
             f"   • 空间: 近期支撑 {recent_low:.0f} 点 | 压力 {recent_high:.0f} 点。\n"
-            f"🧠 **AI 深度形态解盘**:\n"
-            f"   • {insights_str}\n\n"
-            f"{plain_summary}\n\n"
-            f"💡 **总体仓位建议**: {advice}"
+            f"💡 **总体仓位建议**: {advice}{fallback_warning}"
         )
     except Exception as e:
         log.warning(f"宏观状态解析失败: {e}")
@@ -705,7 +706,6 @@ def extract_pure_market_context() -> str:
         cyb_df = fetch_index('sz399006')
 
         cl = sh_df['close']
-        vol = sh_df['volume']
         
         ma10 = cl.rolling(10).mean().iloc[-1]
         ma20 = cl.rolling(20).mean().iloc[-1]
@@ -830,8 +830,8 @@ def get_signals() -> tuple[list[Signal], list, set, int, str, int]:
     flow_map = {}
     
     try:
-        # 核心横截面数据，允许 45 秒超时
-        df_raw = f_spot.result(timeout=45) 
+        # 核心横截面数据，允许 60 秒超时宽限
+        df_raw = f_spot.result(timeout=60) 
     except Exception as e:
         log.error(f"❌ 核心横截面行情获取失败: {e}")
         ex1.shutdown(wait=False, cancel_futures=True)
@@ -842,7 +842,7 @@ def get_signals() -> tuple[list[Signal], list, set, int, str, int]:
 
     try:
         # 资金流是辅助指标(极其容易超时)，单独隔离异常！允许失败降级，绝不影响主流程
-        flow_map = f_flow.result(timeout=15)
+        flow_map = f_flow.result(timeout=20)
     except Exception as e:
         log.warning(f"⚠️ 主力资金流辅助数据获取超时，自动降级跳过: {e}")
         flow_map = {}
@@ -875,11 +875,12 @@ def get_signals() -> tuple[list[Signal], list, set, int, str, int]:
     
     end_s, start_s = now.strftime('%Y%m%d'), (now - timedelta(days=450)).strftime('%Y%m%d')
     
-    ex2 = ThreadPoolExecutor(max_workers=10)
+    # 降低并发，防止东方财富拦截
+    ex2 = ThreadPoolExecutor(max_workers=4)
     futures = {ex2.submit(fetch_hist, r[C.S_CODE], start_s, end_s): r for _, r in pool.iterrows()}
     
     try:
-        for f in as_completed(futures, timeout=90):
+        for f in as_completed(futures, timeout=180): # 增加超时宽限，让低并发任务能安全跑完
             row = futures[f]
             try:
                 hist = f.result(timeout=5)
@@ -954,7 +955,6 @@ def send_dingtalk(signals: list[Signal], watchlist: list, total_pool: int, total
     now_str = now_ts.strftime('%Y-%m-%d %H:%M')
     run_mode = os.environ.get('RUN_MODE', 'normal')
     
-    # 【错误修复】：强制加入“量化”、“提醒”等高频关键字，防止被钉钉机器人的“安全关键词”静默丢弃
     header = f"🤖 AI量化提醒：老股民保姆级盘后总结 {now_str}\n"
     if run_mode == 'market_only':
         header = f"🤖 AI量化提醒：盘后大盘深度体检 {now_str}\n"
@@ -968,7 +968,7 @@ def send_dingtalk(signals: list[Signal], watchlist: list, total_pool: int, total
     if run_mode == 'market_only':
         content = header + "✅ 大盘分析播报完毕，本次任务短路了全量个股运算。"
     elif "接口异常" in market_msg or "网络原因失败" in market_msg:
-        content = header + "⚠️ 今日个股数据扫描因接口异常中断，已为您提供大盘分析参考。"
+        content = header + "⚠️ 今日部分个股数据扫描因接口受限中断，已为您提供核心大盘分析参考。"
     elif not signals and not watchlist:
         if not PUSH_EMPTY: return
         content = f"{header}✅ 安全雷达体检未发现完全符合安全边际的优质股，别乱买，我们空仓防守！"
@@ -1038,7 +1038,6 @@ def send_dingtalk(signals: list[Signal], watchlist: list, total_pool: int, total
         res = requests.post(webhook, json={'msgtype': 'text', 'text': {'content': content}}, timeout=10)
         res_dict = res.json()
         
-        # 【暴露真实报错】：如果钉钉内部静默拒绝了推送，在这里抓出来并红字打印！
         if res_dict.get('errcode', 0) != 0:
             log.error(f"❌ 钉钉接口拒绝推送，请检查「自定义关键词」是否匹配！返回信息: {res_dict}")
         else:
@@ -1049,7 +1048,7 @@ def send_dingtalk(signals: list[Signal], watchlist: list, total_pool: int, total
 
 if __name__ == '__main__':
     try:
-        sigs, watch, pool_size, m_msg, total_mkt = get_signals()
+        sigs, watch, pushed, pool_size, m_msg, total_mkt = get_signals()
         send_dingtalk(sigs, watch, pool_size, total_mkt, m_msg)
         if sigs: save_pushed_state(pushed)
     except Exception as e:

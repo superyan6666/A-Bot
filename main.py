@@ -9,7 +9,6 @@ from functools import wraps
 from typing import Optional, Tuple, Callable
 
 import requests
-from requests.exceptions import RequestException
 import numpy as np
 import pandas as pd
 import pytz
@@ -126,8 +125,6 @@ class Signal:
     stop_loss: float
     target1: float
     ma10: float
-    sector: str = ""
-    sector_pct: float = 0.0
     
     money_risk_msg: str = ""
     tranche_plan_msg: str = ""
@@ -271,6 +268,22 @@ def fetch_index(symbol: str) -> pd.DataFrame:
         df.columns = [c.lower() for c in df.columns]
         return df
     raise ValueError(f'index_empty_{symbol}')
+
+@retry(times=3, delay=2)
+def fetch_core_pool() -> set:
+    """【扩容】获取沪深300 + 中证500 + 中证1000 + 创业板指，囊括蓝筹与高成长核心资产"""
+    pool = set()
+    try:
+        # 000300: 沪深300, 000905: 中证500, 000852: 中证1000, 399006: 创业板指
+        for idx in ["000300", "000905", "000852", "399006"]:
+            df = ak.index_stock_cons(symbol=idx)
+            if df is not None and not df.empty:
+                col = next((c for c in df.columns if '代码' in c), None)
+                if col:
+                    pool.update(df[col].astype(str).str.zfill(6).tolist())
+    except Exception as e:
+        log.warning(f"获取核心成分股池失败，将降级为全市场扫描: {e}")
+    return pool
 
 @retry(times=3, delay=2)
 def fetch_hist(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
@@ -636,6 +649,12 @@ def get_signals() -> tuple[list[Signal], list, set, int, str, int]:
     if df_clean.empty:
         return [], [], pushed, 0, m_msg, 0
 
+    # 【新增】：强制核心资产过滤锁（剔除全市场垃圾股的随机干扰）
+    core_pool = fetch_core_pool()
+    if core_pool:
+        df_clean = df_clean[df_clean[C.S_CODE].isin(core_pool)]
+        log.info(f"💎 已开启【核心优质股池】模式，限定扫描 {len(core_pool)} 只国家队核心及高弹性成分股。")
+
     mask = (df_clean[C.S_PCT] >= c_conf.MIN_PCT_CHG) & \
            (df_clean[C.S_PRICE] <= c_conf.MAX_PRICE) & \
            (df_clean[C.S_MCAP].between(c_conf.MIN_CAP, c_conf.MAX_CAP)) & \
@@ -651,13 +670,11 @@ def get_signals() -> tuple[list[Signal], list, set, int, str, int]:
     pool = df_clean[mask].pipe(lambda d: d[~d[C.S_CODE].isin(pushed)]).copy()
     if pool.empty: return [], [], pushed, len(df_clean), m_msg, len(df_clean)
     
-    if len(pool) > 150:
-        ideal_mask = pool[C.S_PCT].between(-4.0, 6.0)
-        if ideal_mask.sum() > 30:
-            pool = pool[ideal_mask]
-            
-        log.info(f"💡 触发防爆流截断，基于活跃优选策略，保留换手率前 150 只标的参与决选。")
-        pool = pool.sort_values(by=C.S_TURN, ascending=False).head(150)
+    # 【逻辑优化】：将白名单扩容后，截断上限提升至 400，并改用“换手率(TURN)”排序！
+    # 抛弃按市值(MCAP)排序，否则中证1000和创业板的高弹性科技股永远排在四大行后面，拿不到出场机会。
+    if len(pool) > 400:
+        log.info(f"💡 触发防爆流截断，优先保留最活跃(高换手)的 400 只核心标的参与决选。")
+        pool = pool.sort_values(by=C.S_TURN, ascending=False).head(400)
 
     confirmed_data = [] 
     watchlist_data = [] 
@@ -706,8 +723,9 @@ def get_signals() -> tuple[list[Signal], list, set, int, str, int]:
     finally:
         ex2.shutdown(wait=False, cancel_futures=True)
 
-    confirmed_data.sort(key=lambda x: x.score, reverse=True)
-    watchlist_data.sort(key=lambda x: x[2], reverse=True) 
+    # 【绝对确定性排序】：分数为主，股票代码为辅，彻底消灭并发带来的同分股票随机乱序！
+    confirmed_data.sort(key=lambda x: (x.score, x.code), reverse=True)
+    watchlist_data.sort(key=lambda x: (x[2], x[1]), reverse=True) 
     return confirmed_data, watchlist_data, pushed, len(pool), m_msg, len(df_clean)
 
 
@@ -727,7 +745,7 @@ def send_dingtalk(signals: list[Signal], watchlist: list, total_pool: int, total
         header = f"# 🤖 AI量化大盘深度体检\n> **{now_str}**\n\n"
     elif run_mode != 'market_only' and total_market > 0:
         pass_rate = len(signals) / max(total_pool, 1) * 100 if total_pool > 0 else 0
-        header += f"**🔬 严苛雷达**：全市场扫描 {total_market} 只，异动决选 {total_pool} 只，安全通过 {len(signals)} 只 (B+级以上优选率 {pass_rate:.1f}%)\n\n"
+        header += f"**🔬 严苛雷达**：核心股扫描 {total_market} 只，异动决选 {total_pool} 只，安全通过 {len(signals)} 只 (B+级以上优选率 {pass_rate:.1f}%)\n\n"
         
     if market_msg:
         header += f"{market_msg}\n\n---\n\n"
@@ -741,7 +759,6 @@ def send_dingtalk(signals: list[Signal], watchlist: list, total_pool: int, total
         content = f"{header}✅ 安全雷达体检未发现完全符合安全边际的优质股，别乱买，我们空仓防守！"
     else:
         if signals:
-            # 【核心安全机制】：钉钉 Markdown 限制 20KB，强制截取 Top 5 进行全量图文推送
             MAX_DISPLAY = 5
             display_signals = signals[:MAX_DISPLAY]
             hidden_count = len(signals) - len(display_signals)

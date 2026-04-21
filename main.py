@@ -96,16 +96,15 @@ class EnvParser:
 
 @dataclass(frozen=True)
 class Config:
-    # --- 小白专属护城河参数 (已针对多头行情适度放宽) ---
     MIN_CAP: float       = field(default_factory=lambda: EnvParser.get_float('MIN_CAP', 30e8)) 
     MAX_CAP: float       = field(default_factory=lambda: EnvParser.get_float('MAX_CAP', 500e8))
     MAX_PRICE: float     = field(default_factory=lambda: EnvParser.get_float('MAX_PRICE', 60.0))  
     MIN_PE: float        = field(default_factory=lambda: EnvParser.get_float('MIN_PE', 0))    
-    MAX_PE: float        = field(default_factory=lambda: EnvParser.get_float('MAX_PE', 200))       # 接纳高估值成长股
+    MAX_PE: float        = field(default_factory=lambda: EnvParser.get_float('MAX_PE', 200))      
     MIN_TURNOVER: float  = field(default_factory=lambda: EnvParser.get_float('MIN_TURNOVER', 1.5))
     MAX_TURNOVER: float  = field(default_factory=lambda: EnvParser.get_float('MAX_TURNOVER', 15.0)) 
-    MIN_PCT_CHG: float   = field(default_factory=lambda: EnvParser.get_float('MIN_PCT_CHG', 0.0))  # 允许平盘潜伏
-    MIN_VOL_RATIO: float = field(default_factory=lambda: EnvParser.get_float('MIN_VOL_RATIO', 0.6))  # 允许极致缩量洗盘
+    MIN_PCT_CHG: float   = field(default_factory=lambda: EnvParser.get_float('MIN_PCT_CHG', 0.0))  
+    MIN_VOL_RATIO: float = field(default_factory=lambda: EnvParser.get_float('MIN_VOL_RATIO', 0.6))  
     MAX_VOL_RATIO: float = field(default_factory=lambda: EnvParser.get_float('MAX_VOL_RATIO', 10.0))
     
     REQUIRED_COLS: tuple = (C.S_PRICE, C.S_OPEN, C.S_HIGH, C.S_LOW, C.S_VOL, C.S_AMT, 
@@ -362,21 +361,15 @@ class AShareTechnicals:
         if rng <= 0: return None
         
         price_pct = (today[C.H_CLOSE] - min_1y) / rng
-        if price_pct > 0.65: return None 
+        
+        # 【限制放宽】：允许截取主升浪选手，最高分位由 0.65 放宽至 0.88
+        if price_pct > 0.88: return None 
 
         if today[C.H_CLOSE] < today['MA20']: return None
         if not (today['DIF'] >= today['DEA'] or today['DIF'] > -0.1): return None
 
         rsi = float(today.get('RSI14', 50))
-        # 【限制放宽】强势票经常在高位钝化，RSI上限由75放宽至82
         if pd.isna(rsi) or rsi > 82: return None 
-
-        consecutive_down = 0
-        for i in range(2, 8):
-            if len(df) >= i and df[C.H_CLOSE].iloc[-i] < df[C.H_OPEN].iloc[-i]:
-                consecutive_down += 1
-            else:
-                break
 
         ma_convergence = (abs(today['MA10'] - today['MA20']) / today['MA20'] < 0.03) and \
                          (abs(today['MA20'] - today['MA60']) / today['MA60'] < 0.05)
@@ -418,7 +411,6 @@ class AShareTechnicals:
             'dist_ma20': (today[C.H_CLOSE] / today['MA20'] - 1) * 100,
             'red_days': red_days,
             'rsi': rsi,
-            'consecutive_down': consecutive_down,
             'macd_dea': float(today['DEA']),
             'ma10_val': float(today['MA10']), 'ma20_val': float(today['MA20']), 'atr_val': float(today['ATR']),
             'low_val': float(today[C.H_LOW]), 'recent_20_low': float(df[C.H_LOW].iloc[-20:].min()),
@@ -445,6 +437,9 @@ def apply_scoring(data: dict, now: datetime) -> tuple[int, str, str]:
     factors = [
         Factor(lambda d: d['price_pct'] < 0.25, 15, rw, "🟢 【绝对低位】目前买入相当于抄底，长线拿着不慌"),
         Factor(lambda d: 0.25 <= d['price_pct'] <= 0.45, 10, 1.0, "🟢 【相对低位】刚刚从底部爬起来，输时间不输钱"),
+        # 【新增】：给中高位的多头股票赋予合理加分，使其能顺利突破及格线
+        Factor(lambda d: 0.45 < d['price_pct'] <= 0.75, 8, 1.0, "🚀 【多头趋势】股价已脱离底部，处于健康的主升浪区间"),
+        
         Factor(lambda d: d['pe'] > 0 and d['pe'] < 30, 8, 1.0, "🛡️ 【业绩护体】市盈率健康，不是炒空气的垃圾股"),
         Factor(lambda d: d['pb'] > 0 and d['pb'] < 1.2, 10, 1.0, "🧱 【跌无可跌】股价逼近变卖资产的净值，大盘暴跌它也不怕"), 
         Factor(lambda d: d['macd_dea'] >= -0.05, 8, 1.0, "🌊 【多头控盘】MACD处于强势零轴附近，没有深套风险"), 
@@ -462,24 +457,22 @@ def apply_scoring(data: dict, now: datetime) -> tuple[int, str, str]:
         Factor(lambda d: d['has_chip_break'], 15, tw, "🏔️ 【抛压真空】上方的套牢盘已割肉离场，向上拉升没阻力"),
         Factor(lambda d: d['vcp_amp'] < 0.12, 10, 1.0, "🟣 【蓄势待发】近期上下波动极小，主力控盘很稳即将出方向"),
         Factor(lambda d: d['extreme_shrink_vol'], 10, 1.0, "🧊 【没人砸盘】爆发前夕成交量极度萎缩，散户该卖的都卖了"), 
-        Factor(lambda d: d['has_obv_break'], 10, tw, "💸 【真金白银】模型监控到真实的机构资金在创纪录买入"),
+        Factor(lambda d: d['has_obv_break'], 10, tw, "💸 【真金白银】模型监控到真实的资金在创纪录买入"),
         Factor(lambda d: d['has_pullback'], 15, 1.0, "🪃 【上车机会】温和缩量回踩，主力洗盘挖坑给的上车机会"),
         Factor(lambda d: d['lower_shadow_ratio'] > 0.03, 8, 1.0, "📌 【强力护盘】跌下去被大资金迅速买回，下方有人兜底"), 
         
-        Factor(lambda d: d.get('sector_ok', False), 10, 1.0, "🌱 【板块温温】所属板块今日温和上涨，资金在悄悄布局而非疯狂追涨"),
+        Factor(lambda d: d.get('sector_ok', False), 10, 1.0, "🌱 【板块温和】所属板块今日温和上涨，资金在悄悄布局而非疯狂追涨"),
         Factor(lambda d: 0.0 <= d.get('sector_pct', 0) <= 0.3, 5, 1.0, "⚖️ 【独立行情】所属板块表现平淡，全靠个股自身逻辑独立走强"),
         Factor(lambda d: 3.0 <= d.get('sector_pct', 0) < 5.0, 5, 1.0, "📈 【板块较热】板块涨幅较大，已吸引市场目光，可顺势参与但需防回调"),
         
         Factor(lambda d: d.get('rs_rating', 0) > 5,  8, 1.0, "🏆 【跑赢大盘】近60日涨幅超越指数，说明有资金在持续选择它"),
         
         # --- 【排雷扣分项】 ---
-        # 【优化】：连跌飞刀不再一刀切物理拦截，而是给予重度扣分，若其他优势极其突出仍可保留入选机会
-        Factor(lambda d: d.get('consecutive_down', 0) >= 4, -15, 1.0, "🔪 【飞刀预警】近期出现连续阴线急跌，哪怕有反弹也是左侧接飞刀，风险极大(已重度扣分)"),
         Factor(lambda d: d.get('sector_overheated', False), -12, 1.0, "🌋 【板块过热】今日板块暴涨超5%，主力随时借机出货，小白此时入场风险极高(已扣分)"),
-        Factor(lambda d: d.get('rsi', 50) > 68, -10, 1.0, "🌡️ 【微过热】RSI偏高，短线超买迹象，操作需要更小的仓位"),
+        Factor(lambda d: d.get('rsi', 50) > 75, -10, 1.0, "🌡️ 【微过热】RSI偏高，短线超买迹象，操作需要更小的仓位"),
         Factor(lambda d: d.get('rs_rating', 0) < -10, -8, 1.0, "📉 【跑输大盘】近期持续弱于大盘，跟的是被市场冷落的股票"),
         Factor(lambda d: d['has_consecutive_zt'] and d['price_pct'] < 0.40, 10, 1.0, "🔥🔥 【低位连板】刚刚启动的龙头，安全且辨识度高"),
-        Factor(lambda d: d['has_consecutive_zt'] and d['price_pct'] >= 0.40, -20, 1.0, "⚠️ 【高位接盘】股价已被炒高连板，千万别追，容易接盘！"),
+        Factor(lambda d: d['has_consecutive_zt'] and d['price_pct'] >= 0.70, -20, 1.0, "⚠️ 【高位接盘】股价已被炒高连板，千万别追，容易接盘！"),
         Factor(lambda d: d['upper_shadow_pct'] > 18, -15, 1.0, "⚠️ 【诱多预警】冲高后大幅跳水，上方抛压极重，别上当"),
         Factor(lambda d: d['dist_ma20'] > 18, -20, 1.0, "🚫 【追高预警】目前涨得太急离均线太远，随时面临暴跌回调"),
         
@@ -495,7 +488,6 @@ def apply_scoring(data: dict, now: datetime) -> tuple[int, str, str]:
 
     score = max(0, min(score, 100))
     
-    # 【放宽推送门槛】：增加了 B+级 狐狸模式
     if score >= 85:
         level = '⭐⭐⭐⭐⭐ 🐯 [S级·老虎机模式] (胜率极高、跌势有限，最适合盲挂限价建仓)'
     elif score >= 75:
@@ -542,9 +534,10 @@ def process_stock(row: pd.Series, raw_hist: pd.DataFrame, now: datetime, market_
     supports = [data['ma20_val'], data['recent_20_low'], data['boll_lower']]
     valid_supports = [s for s in supports if pd.notna(s) and s < row[C.S_PRICE]]
     
-    stop = max(valid_supports + [row[C.S_PRICE] * 0.93]) * 0.993 
+    # 【限制放宽】容忍止损空间从原来的 7% 放宽到 11%，防止趋势票在洗盘回踩中被错误拦截
+    stop = max(valid_supports + [row[C.S_PRICE] * 0.88]) * 0.993 
     risk_pct = ((row[C.S_PRICE] - stop) / row[C.S_PRICE]) * 100 if row[C.S_PRICE] > 0 else 99
-    if risk_pct > 7.0: return None 
+    if risk_pct > 11.0: return None 
 
     return (data, stop, risk_pct) 
 
@@ -652,7 +645,12 @@ def get_signals() -> tuple[list[Signal], list, set, int, str, int]:
     if pool.empty: return [], [], pushed, len(df_clean), m_msg, len(df_clean)
     
     if len(pool) > 80:
-        log.info(f"💡 今日满足初筛的个股多达 {len(pool)} 只，触发防爆流截断，仅保留活跃度前 80 的标的。")
+        # 【逻辑优化】：优先筛选今天温和起涨(0.5%~4.5%)的优质标的，而不是盲目挑成交额最庞大的巨无霸
+        ideal_mask = pool[C.S_PCT].between(0.5, 4.5)
+        if ideal_mask.sum() > 20:
+            pool = pool[ideal_mask]
+            
+        log.info(f"💡 触发防爆流截断，基于温和起涨优选策略，保留最活跃的 80 只标的参与决选。")
         pool = pool.sort_values(by=C.S_AMT, ascending=False).head(80)
 
     confirmed_data = [] 
@@ -671,18 +669,16 @@ def get_signals() -> tuple[list[Signal], list, set, int, str, int]:
                 result = process_stock(row, hist, now, m_ok, idx_ret)
                 if result:
                     data, stop, risk = result
-                    sector = fetch_stock_sector(row[C.S_CODE])
-                    s_pct = sec_strengths.get(sector, 0.0) if 'sec_strengths' in locals() else 0.0
+                    s_pct = 0.0 # 简化板块请求，默认赋值0，专注个股趋势
                     data.update({
-                        'sector': sector, 
+                        'sector': "", 
                         'sector_pct': s_pct, 
-                        'sector_ok': (0.3 < s_pct < 3.0),
-                        'sector_overheated': (s_pct >= 5.0)
+                        'sector_ok': False,
+                        'sector_overheated': False
                     })
                     
                     score, level, reas = apply_scoring(data, now)
                     
-                    # 【降低发车门槛】：70分以上即可发车，容纳 B+ 级别信号
                     if score >= 70: 
                         target1_price = round(row[C.S_PRICE]*(1+risk*2.5/100), 2)
                         
@@ -697,12 +693,11 @@ def get_signals() -> tuple[list[Signal], list, set, int, str, int]:
                             trigger_time=now.strftime('%H:%M'), reasons=reas,
                             stop_loss=round(stop, 2), target1=target1_price,
                             ma10=round(data['ma10_val'], 2),
-                            sector=sector, sector_pct=s_pct,
                             money_risk_msg=money_msg, tranche_plan_msg=tranche_msg,
                             plan_b_msg=plan_b_msg, hold_period_msg=hold_msg
                         ))
                         pushed.add(row[C.S_CODE]) 
-                    elif score >= 60:  # 观察池门槛相应降低至 60 分
+                    elif score >= 60:  
                         watchlist_data.append((row[C.S_NAME], row[C.S_CODE], score, row[C.S_PRICE]))
                         
             except Exception:

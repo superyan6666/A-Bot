@@ -258,9 +258,7 @@ def retry(times=4, delay=2, exceptions=(Exception,)):
 
 @retry(times=4, delay=2)
 def fetch_index(symbol: str) -> pd.DataFrame:
-    """极其稳定的大盘指数获取，腾讯源优先，防止东方财富拦截海外IP"""
     try:
-        # 主选：腾讯接口 (稳定且返回数据极简)
         df = ak.stock_zh_index_daily_tx(symbol=symbol)
         if df is not None and not df.empty:
             df.columns = [c.lower() for c in df.columns]
@@ -268,7 +266,6 @@ def fetch_index(symbol: str) -> pd.DataFrame:
     except Exception as e:
         log.warning(f"腾讯指数接口波动 ({symbol}): {e}，切换东方财富源...")
     
-    # 备选：东方财富接口
     df = ak.stock_zh_index_daily_em(symbol=symbol)
     if df is not None and not df.empty:
         df.columns = [c.lower() for c in df.columns]
@@ -282,7 +279,6 @@ def fetch_hist(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
         if df is not None and not df.empty:
             return df[list(Config.HIST_COLS)].copy()
     except Exception as e:
-        log.debug(f"{code} 历史主接口波动: {e}，尝试备用源...")
         try:
             df = ak.stock_zh_a_hist_tx(symbol=code, start_date=start, end_date=end, adjust='qfq')
             if df is not None and not df.empty:
@@ -487,8 +483,6 @@ def apply_scoring(data: dict, now: datetime) -> tuple[int, str, str]:
     ]
 
     score, reasons = 40, [meta] if meta else []
-    data['price_pct_pct'] = data['price_pct'] * 100
-    data['vcp_amp_pct'] = data['vcp_amp'] * 100
     
     for f in factors:
         if f.condition(data):
@@ -549,19 +543,6 @@ def process_stock(row: pd.Series, raw_hist: pd.DataFrame, now: datetime, market_
 
 
 # ── 8. 控制器与大盘体检 (Orchestrator) ─────────────────────────────────────────
-def fetch_stock_sector(code: str) -> str:
-    try:
-        df = ak.stock_individual_info_em(symbol=code)
-        v = df[df[C.INFO_ITEM] == '行业'][C.INFO_VAL].values[0]
-        return str(v) if pd.notna(v) else ""
-    except: return ""
-
-def fetch_sector_strength() -> dict:
-    try:
-        df = ak.stock_board_industry_spot_em()
-        return dict(zip(df[C.B_NAME], df[C.B_PCT]))
-    except: return {}
-
 def extract_market_context(df_raw: pd.DataFrame, c_conf: Config) -> tuple[pd.DataFrame, bool, str, float, bool]:
     market_ok, market_msg, index_ret, market_overheated = True, "", 0.0, False
     if len(df_raw) < 1000: return pd.DataFrame(), False, "API 异常，横截面数据不足", 0.0, False
@@ -630,15 +611,17 @@ def get_signals() -> tuple[list[Signal], list, set, int, str, int]:
     if not IS_MANUAL and not is_valid_run_time(now): 
         return [], [], set(), 0, "", 0
 
-    c_conf, pushed = Config(), load_pushed_state()
+    c_conf, pushed = load_pushed_state(), load_pushed_state() # 初始化配置
 
     try:
-        # 直接拉取横截面数据，杜绝并发引起的封锁
+        # 直接拉取横截面数据，极速获取，无视并发封锁
         df_raw = fetch_spot()
     except Exception as e:
         log.error(f"❌ 核心横截面行情获取失败: {e}")
         return [], [], pushed, 0, f"⚠️ **行情接口异常，体检中断**: {e}", 0
 
+    # 大盘基准测算（不依赖额外网络请求，安全且快）
+    c_conf = Config()
     df_clean, m_ok, m_msg, idx_ret, m_overheated = extract_market_context(df_raw, c_conf)
 
     if run_mode == 'market_only':
@@ -662,34 +645,31 @@ def get_signals() -> tuple[list[Signal], list, set, int, str, int]:
 
     pool = df_clean[mask].pipe(lambda d: d[~d[C.S_CODE].isin(pushed)]).copy()
     if pool.empty: return [], [], pushed, len(df_clean), m_msg, len(df_clean)
-
-    sec_strengths = fetch_sector_strength()
     
+    # ── 牛市保险栓：防止候选股票过多导致永远跑不完从而触发超时 ──
+    # 将按照成交额活跃度排序，只提取前 80 只最活跃的个股进行测算
+    if len(pool) > 80:
+        log.info(f"💡 今日满足初筛的个股多达 {len(pool)} 只，触发防爆流截断，仅保留活跃度前 80 的标的。")
+        pool = pool.sort_values(by=C.S_AMT, ascending=False).head(80)
+
     confirmed_data = [] 
     watchlist_data = [] 
     
     end_s, start_s = now.strftime('%Y%m%d'), (now - timedelta(days=450)).strftime('%Y%m%d')
     
-    # 【大幅降低并发】：控制在 4，防止东方财富拦截 GitHub 海外 IP
+    # 将并发数稳稳锁在 4，绝不踩东方财富的红线
     ex2 = ThreadPoolExecutor(max_workers=4)
     futures = {ex2.submit(fetch_hist, r[C.S_CODE], start_s, end_s): r for _, r in pool.iterrows()}
     
     try:
-        for f in as_completed(futures, timeout=180): 
+        # 设定单股最大等待超时，保证在限定时间内全部吐出
+        for f in as_completed(futures, timeout=150): 
             row = futures[f]
             try:
                 hist = f.result(timeout=5)
                 result = process_stock(row, hist, now, m_ok, idx_ret)
                 if result:
                     data, stop, risk = result
-                    sector = fetch_stock_sector(row[C.S_CODE])
-                    s_pct = sec_strengths.get(sector, 0.0)
-                    data.update({
-                        'sector': sector, 
-                        'sector_pct': s_pct, 
-                        'sector_ok': (0.3 < s_pct < 3.0),
-                        'sector_overheated': (s_pct >= 5.0)
-                    })
                     
                     score, level, reas = apply_scoring(data, now)
                     
@@ -707,7 +687,6 @@ def get_signals() -> tuple[list[Signal], list, set, int, str, int]:
                             trigger_time=now.strftime('%H:%M'), reasons=reas,
                             stop_loss=round(stop, 2), target1=target1_price,
                             ma10=round(data['ma10_val'], 2),
-                            sector=sector, sector_pct=s_pct,
                             money_risk_msg=money_msg, tranche_plan_msg=tranche_msg,
                             plan_b_msg=plan_b_msg, hold_period_msg=hold_msg
                         ))
@@ -718,7 +697,7 @@ def get_signals() -> tuple[list[Signal], list, set, int, str, int]:
             except Exception:
                 pass
     except FuturesTimeoutError:
-        pass
+        log.warning("⚠️ 后台运算达到极值，提前熔断保存已有成果。")
     finally:
         ex2.shutdown(wait=False, cancel_futures=True)
 
@@ -777,14 +756,13 @@ def send_dingtalk(signals: list[Signal], watchlist: list, total_pool: int, total
             
             parts = []
             for s in signals:
-                sec_info = f"🏷️ 热点板块：{s.sector} (今日 {s.sector_pct:+.2f}%)\n" if s.sector else ""
                 warn_msg = "⚡ 【风险警示】：该股为创业板(波动±20%)，心脏不好的务必把买入金额砍半！\n" if str(s.code).startswith('300') else ""
                 prefix = '1' if str(s.code).startswith('6') else '0'
                 tdx_market = 'SH' if str(s.code).startswith('6') else 'SZ' 
                 
                 parts.append(
                     f"【{s.name} ({s.code})】\n"
-                    f"{sec_info}{warn_msg}"
+                    f"{warn_msg}"
                     f"⏰ 触发时间：{s.trigger_time}\n"
                     f"📊 综合评级：{s.score}分 {s.level}\n"
                     f"💰 今日收盘：¥{s.price} ({s.pct_chg})\n"

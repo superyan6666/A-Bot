@@ -742,15 +742,16 @@ def send_dingtalk(signals: list[Signal], watchlist: list, total_pool: int, total
     now_str = now_ts.strftime('%Y-%m-%d %H:%M')
     run_mode = os.environ.get('RUN_MODE', 'normal')
     
-    header = f"🤖 AI量化提醒：老股民保姆级盘后总结 {now_str}\n"
+    # 【升级】：转用 Markdown 排版，支持标题、加粗和直接渲染图床图片
+    header = f"# 🤖 AI量化保姆级盘后总结\n> **{now_str}**\n\n"
     if run_mode == 'market_only':
-        header = f"🤖 AI量化提醒：盘后大盘深度体检 {now_str}\n"
+        header = f"# 🤖 AI量化大盘深度体检\n> **{now_str}**\n\n"
     elif run_mode != 'market_only' and total_market > 0:
         pass_rate = len(signals) / max(total_pool, 1) * 100 if total_pool > 0 else 0
-        header += f"\n🔬 严苛雷达：全市场扫描 {total_market} 只个股，异动决选 {total_pool} 只，安全通过 {len(signals)} 只 (B+级以上优选率 {pass_rate:.1f}%)\n"
+        header += f"**🔬 严苛雷达**：全市场扫描 {total_market} 只，异动决选 {total_pool} 只，安全通过 {len(signals)} 只 (B+级以上优选率 {pass_rate:.1f}%)\n\n"
         
     if market_msg:
-        header += f"\n{market_msg}\n\n"
+        header += f"{market_msg}\n\n---\n\n"
 
     if run_mode == 'market_only':
         content = header + "✅ 大盘分析播报完毕，本次任务短路了全量个股运算。"
@@ -765,66 +766,79 @@ def send_dingtalk(signals: list[Signal], watchlist: list, total_pool: int, total
             quality_tag = "🥇 信号质量优秀，可按剧本布局" if avg_score >= 80 \
                 else "🥈 信号质量尚可，需严格限价且减半仓位"
                 
-            content = header + f"📈 **今日正式推送质量自检**：平均 {avg_score:.0f} 分 | {quality_tag}\n\n"
+            content = header + f"### 📈 今日正式推送质量自检\n**平均 {avg_score:.0f} 分 | {quality_tag}**\n\n"
             
             cold_gate = (
-                "⏸️ ━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                "📖 **买入前，请先做完这个自检（30秒）：**\n"
-                "   □ 我这笔钱3年内不会急用？\n"
-                "   □ 就算亏掉30%，我也不会睡不着觉？\n"
-                "   □ 我不会因为这只股跌了就反复刷手机？\n\n"
-                "   ✅ 三项全对 → 可以按计划操作\n"
-                "   ❌ 有一项不对 → 把计划买入金额砍掉一半，再看\n"
-                "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                "> ⏸️ ━━━━━━━━━━━━━━━━━━━━\n"
+                "> 📖 **买入前，请先做完这个自检（30秒）：**\n"
+                "> 1. 我这笔钱3年内不会急用？\n"
+                "> 2. 就算亏掉30%，我也不会睡不着觉？\n"
+                "> 3. 我不会因为这只股跌了就反复刷手机？\n>\n"
+                "> ✅ 三项全对 → 可以按计划操作\n"
+                "> ❌ 有一项不对 → 把计划买入金额砍掉一半，再看\n"
+                "> ━━━━━━━━━━━━━━━━━━━━\n\n"
             )
             content += cold_gate
             
             parts = []
             for s in signals:
-                warn_msg = "⚡ 【风险警示】：该股为创业板(波动±20%)，心脏不好的务必把买入金额砍半！\n" if str(s.code).startswith('300') else ""
+                warn_msg = "⚡ **【风险警示】**：该股为创业板(波动±20%)，心脏不好的务必把买入金额砍半！\n\n" if str(s.code).startswith('300') else ""
                 prefix = '1' if str(s.code).startswith('6') else '0'
                 tdx_market = 'SH' if str(s.code).startswith('6') else 'SZ' 
                 
+                # 【核心巧思】：直接拼接新浪财经的静态 GIF 图床地址 (weekly 代表周K，daily 代表日K)
+                sina_market = 'sh' if str(s.code).startswith('6') else 'sz'
+                kline_url = f"http://image.sinajs.cn/newchart/weekly/n/{sina_market}{s.code}.gif"
+                
                 parts.append(
-                    f"【{s.name} ({s.code})】\n"
+                    f"## 【{s.name} ({s.code})】\n"
                     f"{warn_msg}"
-                    f"⏰ 触发时间：{s.trigger_time}\n"
-                    f"📊 综合评级：{s.score}分 {s.level}\n"
-                    f"💰 今日收盘：¥{s.price} ({s.pct_chg})\n"
-                    f"--- 💡 为什么机器选出它？ ---\n{s.reasons}\n"
-                    f"--- 🛡️ 小白专属次日操作剧本 ---\n"
+                    f"- **触发时间**：{s.trigger_time}\n"
+                    f"- **综合评级**：{s.score}分 {s.level}\n"
+                    f"- **今日收盘**：¥{s.price} ({s.pct_chg})\n\n"
+                    f"![大周期周K线图]({kline_url})\n\n"
+                    f"**💡 为什么机器选出它？**\n{s.reasons}\n\n"
+                    f"**🛡️ 小白专属次日操作剧本**\n"
                     f"{s.hold_period_msg}\n\n"
                     f"{s.money_risk_msg}\n\n"
                     f"{s.tranche_plan_msg}\n\n"
                     f"{s.plan_b_msg}\n\n"
-                    f"🎯 **铁血移动止盈**：赚钱后如果收盘跌破 ¥{s.ma10} (10日线)，别犹豫，立刻卖出一半保住利润！\n"
-                    f"🚫 **次日防守纪律**：如果明天开盘直接高开超过 4%，说明有人抢跑，请直接放弃，绝不追高！\n"
-                    f"🔗 东方财富直达：https://quote.eastmoney.com/unify/r/{prefix}.{s.code}\n"
-                    f"🔗 复制看盘：{tdx_market}{s.code}\n"
+                    f"🎯 **铁血移动止盈**：赚钱后如果收盘跌破 ¥{s.ma10} (10日线)，别犹豫，立刻卖出一半保住利润！\n\n"
+                    f"🚫 **次日防守纪律**：如果明天开盘直接高开超过 4%，说明有人抢跑，请直接放弃，绝不追高！\n\n"
+                    f"🔗 [点击跳转东方财富看盘](https://quote.eastmoney.com/unify/r/{prefix}.{s.code})\n\n"
+                    f"🔗 通达信快捷看盘：复制代码 `{s.code}` 后直接打开通达信App即可弹出\n"
                 )
-            content += "\n".join(parts)
+            content += "\n---\n".join(parts)
         else:
             content = header + "✅ 今日未发现 B+ 级以上机会，正式推荐列表空仓防守中。\n"
 
         if watchlist:
             watch_lines = "\n".join(
-                f"   • {name}({code}) ¥{price} 得分{score}分"
+                f"- `{code}` **{name}** (¥{price}) 得分: **{score}分**"
                 for name, code, score, price in watchlist[:5]
             )
             content += (
-                f"\n\n👁️ **候补观察池（看看就好，手别动）**\n"
-                f"{watch_lines}\n"
-                f"以上标的当前评级不足 70 分，系统判断波动或风险偏大，暂不提供操作剧本。仅作盘感追踪，待其评级升至发车线后再考虑介入。"
+                f"\n\n---\n### 👁️ 候补观察池（看看就好，手别动）\n"
+                f"{watch_lines}\n\n"
+                f"*以上标的当前评级不足 70 分，系统判断波动或风险偏大，暂不提供操作剧本。仅作盘感追踪，待其评级升至发车线后再考虑介入。*"
             )
         
         content += (
-            "\n\n🤔 **买入前灵魂拷问：**\n"
+            "\n\n---\n**🤔 买入前灵魂拷问：**\n"
             "如果明天买入的股票跌了 5%，我会焦虑得睡不着觉吗？\n"
-            "→ 如果会，请把你准备买入的金额【再砍掉一半】！投资是为了生活更好，不是为了找罪受。"
+            "**→ 如果会，请把你准备买入的金额【再砍掉一半】！投资是为了生活更好，不是为了找罪受。**"
         )
 
     try:
-        res = requests.post(webhook, json={'msgtype': 'text', 'text': {'content': content}}, timeout=10)
+        # 【关键修改】：将钉钉发送类型(msgtype)从 text 改为 markdown
+        payload = {
+            'msgtype': 'markdown',
+            'markdown': {
+                'title': '🤖 AI量化盘后提醒',
+                'text': content
+            }
+        }
+        res = requests.post(webhook, json=payload, timeout=10)
         res_dict = res.json()
         
         if res_dict.get('errcode', 0) != 0:

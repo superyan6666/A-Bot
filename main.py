@@ -97,15 +97,18 @@ class EnvParser:
 @dataclass(frozen=True)
 class Config:
     MIN_CAP: float       = field(default_factory=lambda: EnvParser.get_float('MIN_CAP', 30e8)) 
-    MAX_CAP: float       = field(default_factory=lambda: EnvParser.get_float('MAX_CAP', 500e8))
+    # 【放宽】：接纳核心资产蓝筹股，上限由 500亿 提升至 2000亿
+    MAX_CAP: float       = field(default_factory=lambda: EnvParser.get_float('MAX_CAP', 2000e8))
     MAX_PRICE: float     = field(default_factory=lambda: EnvParser.get_float('MAX_PRICE', 60.0))  
     MIN_PE: float        = field(default_factory=lambda: EnvParser.get_float('MIN_PE', 0))    
-    MAX_PE: float        = field(default_factory=lambda: EnvParser.get_float('MAX_PE', 200))      
-    MIN_TURNOVER: float  = field(default_factory=lambda: EnvParser.get_float('MIN_TURNOVER', 1.5))
-    MAX_TURNOVER: float  = field(default_factory=lambda: EnvParser.get_float('MAX_TURNOVER', 15.0)) 
-    MIN_PCT_CHG: float   = field(default_factory=lambda: EnvParser.get_float('MIN_PCT_CHG', 0.0))  
-    MIN_VOL_RATIO: float = field(default_factory=lambda: EnvParser.get_float('MIN_VOL_RATIO', 0.6))  
-    MAX_VOL_RATIO: float = field(default_factory=lambda: EnvParser.get_float('MAX_VOL_RATIO', 10.0))
+    # 【放宽】：接纳高估值科技成长股
+    MAX_PE: float        = field(default_factory=lambda: EnvParser.get_float('MAX_PE', 300))      
+    # 【放宽】：接纳蓝筹股天然偏低的换手率
+    MIN_TURNOVER: float  = field(default_factory=lambda: EnvParser.get_float('MIN_TURNOVER', 0.5))
+    MAX_TURNOVER: float  = field(default_factory=lambda: EnvParser.get_float('MAX_TURNOVER', 25.0)) 
+    MIN_PCT_CHG: float   = field(default_factory=lambda: EnvParser.get_float('MIN_PCT_CHG', -1.0))  
+    MIN_VOL_RATIO: float = field(default_factory=lambda: EnvParser.get_float('MIN_VOL_RATIO', 0.5))  
+    MAX_VOL_RATIO: float = field(default_factory=lambda: EnvParser.get_float('MAX_VOL_RATIO', 15.0))
     
     REQUIRED_COLS: tuple = (C.S_PRICE, C.S_OPEN, C.S_HIGH, C.S_LOW, C.S_VOL, C.S_AMT, 
                             C.S_PCT, C.S_TURN, C.S_CODE, C.S_NAME, C.S_MCAP, C.S_PE, C.S_PB)
@@ -362,15 +365,14 @@ class AShareTechnicals:
         
         price_pct = (today[C.H_CLOSE] - min_1y) / rng
         
-        if price_pct > 0.88: return None 
+        if price_pct > 0.96: return None 
 
-        # 【限制放宽】容忍微跌破20日线的假摔洗盘（允许最大2%跌破），不再一刀切毙命
-        if today[C.H_CLOSE] < today['MA20'] * 0.98: return None
+        if today[C.H_CLOSE] < today['MA20'] * 0.95: return None
         
         if not (today['DIF'] >= today['DEA'] or today['DIF'] > -0.1): return None
 
         rsi = float(today.get('RSI14', 50))
-        if pd.isna(rsi) or rsi > 82: return None 
+        if pd.isna(rsi) or rsi > 85: return None 
 
         consecutive_down = 0
         for i in range(2, 8):
@@ -378,11 +380,10 @@ class AShareTechnicals:
                 consecutive_down += 1
             else:
                 break
-        # 【杀手清除】删除了 if consecutive_down >= 4: return None 物理阻断，交由打分引擎扣分
 
-        ma_convergence = (abs(today['MA10'] - today['MA20']) / today['MA20'] < 0.03) and \
-                         (abs(today['MA20'] - today['MA60']) / today['MA60'] < 0.05)
-        extreme_shrink_vol = yest[C.H_VOL] < today['MA20_V'] * 0.65
+        ma_convergence = (abs(today['MA10'] - today['MA20']) / today['MA20'] < 0.05) and \
+                         (abs(today['MA20'] - today['MA60']) / today['MA60'] < 0.08)
+        extreme_shrink_vol = yest[C.H_VOL] < today['MA20_V'] * 0.75
 
         rec120 = df.iloc[-121:-1]
         has_chip_break = False
@@ -401,7 +402,7 @@ class AShareTechnicals:
             yest[C.H_LOW] <= yest['MA20'] * 1.02 and 
             today[C.H_CLOSE] > today['MA20'] and 
             today[C.H_VOL] < today['MA5_V'] and
-            body_pct >= 0.003
+            body_pct > -0.05
         )
 
         return {
@@ -445,17 +446,23 @@ def apply_scoring(data: dict, now: datetime) -> tuple[int, str, str]:
     in_danger, danger_label = is_earnings_danger_zone(now)
 
     factors = [
+        # ── 柔性风格适配（低成本多模态选股） ──
+        Factor(lambda d: d['mcap'] > 300e8 and 0 < d['pe'] < 25 and d['pb'] < 3, 12, 1.0, "🏢 【价值蓝筹】大市值低估值核心资产，防守属性极强"),
+        Factor(lambda d: str(d.get('code', '')).startswith('300') and d['vol_ratio'] > 1.2 and d['rs_rating'] > 5, 12, 1.0, "🚀 【弹性成长】创业板高弹性或资金高低切标的，接力意愿强"),
+        Factor(lambda d: d['price_pct'] < 0.3 and 0 < d['pb'] < 1.0, 10, 1.0, "♻️ 【困境反转】股价严重破净且处于绝对低位，安全垫极厚"),
+        
         Factor(lambda d: d['price_pct'] < 0.25, 15, rw, "🟢 【绝对低位】目前买入相当于抄底，长线拿着不慌"),
         Factor(lambda d: 0.25 <= d['price_pct'] <= 0.45, 10, 1.0, "🟢 【相对低位】刚刚从底部爬起来，输时间不输钱"),
-        Factor(lambda d: 0.45 < d['price_pct'] <= 0.75, 8, 1.0, "🚀 【多头趋势】股价已脱离底部，处于健康的主升浪区间"),
+        Factor(lambda d: 0.45 < d['price_pct'] <= 0.85, 8, 1.0, "🚀 【多头趋势】股价已脱离底部，处于健康的主升浪区间"),
         
         Factor(lambda d: d['pe'] > 0 and d['pe'] < 30, 8, 1.0, "🛡️ 【业绩护体】市盈率健康，不是炒空气的垃圾股"),
-        Factor(lambda d: d['pb'] > 0 and d['pb'] < 1.2, 10, 1.0, "🧱 【跌无可跌】股价逼近变卖资产的净值，大盘暴跌它也不怕"), 
         Factor(lambda d: d['macd_dea'] >= -0.05, 8, 1.0, "🌊 【多头控盘】MACD处于强势零轴附近，没有深套风险"), 
         
-        Factor(lambda d: 0 <= d['dist_ma20'] <= 4.0, 15, 1.0, "🧲 【贴地潜伏】目前价格紧贴支撑线，属于绝佳的安全低吸点，没追高"),
+        Factor(lambda d: 0 <= d['dist_ma20'] <= 6.0, 15, 1.0, "🧲 【贴地潜伏】目前价格紧贴支撑线，属于绝佳的安全低吸点，没追高"),
+        Factor(lambda d: 6.0 < d['dist_ma20'] <= 12.0, 8, 1.0, "🚀 【强势上攻】距离20日线有一定空间，依托10日线强势上攻"),
         Factor(lambda d: d['dist_ma20'] < 0, -10, 1.0, "⚠️ 【破位嫌疑】当前处于20日线下方，属于弱势反弹，需警惕冲高回落"),
-        Factor(lambda d: 40 <= d.get('rsi', 50) <= 62, 10, 1.0, "📊 【温度适中】RSI处于健康买入区间，不冷不热正是下手时机"),
+        
+        Factor(lambda d: 40 <= d.get('rsi', 50) <= 68, 10, 1.0, "📊 【温度适中】RSI处于健康买入区间，不冷不热正是下手时机"),
         
         Factor(lambda d: d['bull_rank'], 10, 1.0, "📈 【顺势而为】均线多头排列，跟着主力资金大部队走"),
         Factor(lambda d: d['ma_convergence'], 12, 1.0, "🌪️ 【面临变盘】短期和长期成本几乎重合，随时向上爆发"), 
@@ -480,19 +487,17 @@ def apply_scoring(data: dict, now: datetime) -> tuple[int, str, str]:
         # --- 【排雷扣分项】 ---
         Factor(lambda d: d.get('consecutive_down', 0) >= 4, -15, 1.0, "🔪 【飞刀预警】近期出现连续阴线急跌，左侧接飞刀风险极大(已重度扣分)"),
         Factor(lambda d: d.get('sector_overheated', False), -12, 1.0, "🌋 【板块过热】今日板块暴涨超5%，主力随时借机出货，风险极高(已扣分)"),
-        Factor(lambda d: d.get('rsi', 50) > 75, -10, 1.0, "🌡️ 【微过热】RSI偏高，短线超买迹象，操作需要更小的仓位"),
+        Factor(lambda d: d.get('rsi', 50) > 80, -10, 1.0, "🌡️ 【微过热】RSI偏高，短线超买迹象，操作需要更小的仓位"),
         Factor(lambda d: d.get('rs_rating', 0) < -10, -8, 1.0, "📉 【跑输大盘】近期持续弱于大盘，跟的是被市场冷落的股票"),
         Factor(lambda d: d['has_consecutive_zt'] and d['price_pct'] < 0.40, 10, 1.0, "🔥🔥 【低位连板】刚刚启动的龙头，安全且辨识度高"),
-        Factor(lambda d: d['has_consecutive_zt'] and d['price_pct'] >= 0.70, -20, 1.0, "⚠️ 【高位接盘】股价已被炒高连板，千万别追，容易接盘！"),
+        Factor(lambda d: d['has_consecutive_zt'] and d['price_pct'] >= 0.85, -20, 1.0, "⚠️ 【高位接盘】股价已被炒高连板，千万别追，容易接盘！"),
         Factor(lambda d: d['upper_shadow_pct'] > 18, -15, 1.0, "⚠️ 【诱多预警】冲高后大幅跳水，上方抛压极重，别上当"),
         Factor(lambda d: d['dist_ma20'] > 18, -20, 1.0, "🚫 【追高预警】目前涨得太急离均线太远，随时面临暴跌回调"),
         
-        # 【限制放宽】大幅减轻对中小盘在财报季的无差别轰炸（-15 -> -8）
         Factor(lambda d: in_danger and d['mcap'] < 100e8, -8, 1.0, f"📅 【财报防守】当前属于{danger_label}高危期，小盘股需防业绩变脸(已扣分)")
     ]
 
-    # 【提升基础底仓分数】：由 40 抬高到 45，让优秀标的更容易越过 70 分及格线
-    score, reasons = 45, [meta] if meta else []
+    score, reasons = 50, [meta] if meta else []
     
     for f in factors:
         if f.condition(data):
@@ -543,17 +548,15 @@ def process_stock(row: pd.Series, raw_hist: pd.DataFrame, now: datetime, market_
     data['mcap'] = float(row.get(C.S_MCAP, 0))
     data['vol_ratio'] = float(row.get(C.S_VR, 1.0))
     data['rs_rating'] = ((row[C.S_PRICE] / data['close_60d_ago'] - 1) * 100 - index_ret) if data['close_60d_ago'] > 0 else 0
+    # 存入code用于风格分类判定
+    data['code'] = str(row[C.S_CODE])
     
-    # 【修复重点】：将 MA10（10日线）加入有效支撑位判断！
-    # 对于走主升浪的趋势股，它们回踩的往往是10日线而不是20日线，这能彻底避免它们被误判为“高风险乖离”而惨遭枪毙！
     supports = [data['ma10_val'], data['ma20_val'], data['recent_20_low'], data['boll_lower']]
     valid_supports = [s for s in supports if pd.notna(s) and s < row[C.S_PRICE]]
     
-    # 止损位：强力支撑位 或者 最多允许跌 12%
     stop = max(valid_supports + [row[C.S_PRICE] * 0.88]) * 0.993 
     risk_pct = ((row[C.S_PRICE] - stop) / row[C.S_PRICE]) * 100 if row[C.S_PRICE] > 0 else 99
     
-    # 【限制放宽】硬性风控容忍度提升至 15.0%，不再轻易拦截右侧发车的主升浪品种
     if risk_pct > 15.0: return None 
 
     return (data, stop, risk_pct) 
@@ -661,14 +664,13 @@ def get_signals() -> tuple[list[Signal], list, set, int, str, int]:
     pool = df_clean[mask].pipe(lambda d: d[~d[C.S_CODE].isin(pushed)]).copy()
     if pool.empty: return [], [], pushed, len(df_clean), m_msg, len(df_clean)
     
-    if len(pool) > 80:
-        # 【逻辑优化】：优先筛选今天温和波动的优质标的（涵盖假摔洗盘和稳步起涨），扩宽选池容错面
-        ideal_mask = pool[C.S_PCT].between(-1.0, 5.0)
+    if len(pool) > 150:
+        ideal_mask = pool[C.S_PCT].between(-2.0, 6.0)
         if ideal_mask.sum() > 30:
             pool = pool[ideal_mask]
             
-        log.info(f"💡 触发防爆流截断，基于优选策略，保留最活跃的 80 只标的参与决选。")
-        pool = pool.sort_values(by=C.S_AMT, ascending=False).head(80)
+        log.info(f"💡 触发防爆流截断，基于活跃优选策略，保留换手率前 150 只标的参与决选。")
+        pool = pool.sort_values(by=C.S_TURN, ascending=False).head(150)
 
     confirmed_data = [] 
     watchlist_data = [] 
@@ -679,14 +681,14 @@ def get_signals() -> tuple[list[Signal], list, set, int, str, int]:
     futures = {ex2.submit(fetch_hist, r[C.S_CODE], start_s, end_s): r for _, r in pool.iterrows()}
     
     try:
-        for f in as_completed(futures, timeout=150): 
+        for f in as_completed(futures, timeout=240): 
             row = futures[f]
             try:
                 hist = f.result(timeout=5)
                 result = process_stock(row, hist, now, m_ok, idx_ret)
                 if result:
                     data, stop, risk = result
-                    s_pct = 0.0 # 简化板块请求，默认赋值0，专注个股趋势
+                    s_pct = 0.0 
                     data.update({
                         'sector': "", 
                         'sector_pct': s_pct, 
@@ -745,7 +747,7 @@ def send_dingtalk(signals: list[Signal], watchlist: list, total_pool: int, total
         header = f"🤖 AI量化提醒：盘后大盘深度体检 {now_str}\n"
     elif run_mode != 'market_only' and total_market > 0:
         pass_rate = len(signals) / max(total_pool, 1) * 100 if total_pool > 0 else 0
-        header += f"\n🔬 严苛雷达：全市场扫描 {total_market} 只个股，异动 {total_pool} 只，安全通过 {len(signals)} 只 (B+级以上通过率 {pass_rate:.1f}%)\n"
+        header += f"\n🔬 严苛雷达：全市场扫描 {total_market} 只个股，异动决选 {total_pool} 只，安全通过 {len(signals)} 只 (B+级以上优选率 {pass_rate:.1f}%)\n"
         
     if market_msg:
         header += f"\n{market_msg}\n\n"

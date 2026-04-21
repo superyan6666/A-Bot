@@ -691,13 +691,13 @@ def extract_market_context(df_raw: pd.DataFrame, c_conf: Config) -> tuple[pd.Dat
             f"🧠 **AI 深度形态解盘**:\n"
             f"   • {insights_str}\n\n"
             f"{plain_summary}\n\n"
-            f"💡 **总体仓位建议**: {advice}{fallback_warning}"
+            f"💡 **总体仓位建议**: {advice}"
         )
     except Exception as e:
         log.warning(f"宏观状态解析失败: {e}")
         market_msg = f"大盘深度解析由于网络原因失败: {e}\n"
     
-    return df, market_ok, market_msg, index_ret, market_overheated # 注意这里返回df_raw，后续会过滤
+    return df_raw, market_ok, market_msg, index_ret, market_overheated 
 
 def extract_pure_market_context() -> str:
     """完全短路横截面的纯指数深度体检"""
@@ -948,15 +948,18 @@ def get_signals() -> tuple[list[Signal], list, set, int, str, int]:
 # ── 9. 通知推送逻辑 ───────────────────────────────────────────────────────────
 def send_dingtalk(signals: list[Signal], watchlist: list, total_pool: int, total_market: int, market_msg: str) -> None:
     webhook = os.environ.get('DINGTALK_WEBHOOK')
-    if not webhook: return
+    if not webhook:
+        log.error("❌ 未配置 DINGTALK_WEBHOOK 环境变量，取消推送！")
+        return
     
     now_ts = datetime.now(TZ_BJS)
     now_str = now_ts.strftime('%Y-%m-%d %H:%M')
     run_mode = os.environ.get('RUN_MODE', 'normal')
     
-    header = f"🤖 AI 老股民保姆级盘后总结 {now_str}\n"
+    # 【错误修复】：强制加入“量化”、“提醒”等高频关键字，防止被钉钉机器人的“安全关键词”静默丢弃
+    header = f"🤖 AI量化提醒：老股民保姆级盘后总结 {now_str}\n"
     if run_mode == 'market_only':
-        header = f"🤖 AI 盘后大盘深度体检 {now_str}\n"
+        header = f"🤖 AI量化提醒：盘后大盘深度体检 {now_str}\n"
     elif run_mode != 'market_only' and total_market > 0:
         pass_rate = len(signals) / max(total_pool, 1) * 100 if total_pool > 0 else 0
         header += f"\n🔬 严苛雷达：全市场扫描 {total_market} 只个股，异动 {total_pool} 只，安全通过 {len(signals)} 只 (A级以上通过率 {pass_rate:.1f}%)\n"
@@ -1027,10 +1030,17 @@ def send_dingtalk(signals: list[Signal], watchlist: list, total_pool: int, total
         )
 
     try:
-        requests.post(webhook, json={'msgtype': 'text', 'text': {'content': content}}, timeout=10)
-        log.info(f"✅ 推送成功 ({len(signals)}正式 / {len(watchlist)}观察)")
+        res = requests.post(webhook, json={'msgtype': 'text', 'text': {'content': content}}, timeout=10)
+        res_dict = res.json()
+        
+        # 【暴露真实报错】：如果钉钉内部静默拒绝了推送，在这里抓出来并红字打印！
+        if res_dict.get('errcode', 0) != 0:
+            log.error(f"❌ 钉钉接口拒绝推送，请检查「自定义关键词」是否匹配！返回信息: {res_dict}")
+        else:
+            log.info(f"✅ 推送成功 ({len(signals)}正式 / {len(watchlist)}观察)")
+            
     except Exception as e:
-        log.error(f"❌ 推送失败: {e}")
+        log.error(f"❌ 推送网络请求失败: {e}")
 
 if __name__ == '__main__':
     try:

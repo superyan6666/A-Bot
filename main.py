@@ -3,10 +3,10 @@ import time
 import json
 import socket
 import logging
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from functools import wraps
-from typing import Optional, List, Tuple, Callable, Dict, Any
+from typing import Optional, Tuple, Callable
 
 import requests
 from requests.exceptions import RequestException
@@ -18,9 +18,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as
 # ── 1. 环境与日志配置 ──────────────────────────────────────────────────────────
 TZ_BJS       = pytz.timezone('Asia/Shanghai')
 STATE_FILE   = 'pushed_state.json'
-TRADING_LOG  = 'trade_history.json' 
 IS_MANUAL    = os.environ.get('GITHUB_EVENT_NAME') == 'workflow_dispatch'
-IS_CI        = os.environ.get('GITHUB_ACTIONS') == 'true'
 PUSH_EMPTY   = os.environ.get('PUSH_EMPTY_RESULT', 'true').lower() in ('true', '1', 'yes')
 
 socket.setdefaulttimeout(15.0)
@@ -128,7 +126,6 @@ class Signal:
     reasons: str
     stop_loss: float
     target1: float
-    target2: float
     ma10: float
     sector: str = ""
     sector_pct: float = 0.0
@@ -438,7 +435,7 @@ class AShareTechnicals:
         if not (today['DIF'] >= today['DEA'] or today['DIF'] > -0.1): return None
 
         rsi = float(today.get('RSI14', 50))
-        if pd.isna(rsi) or rsi > 78: return None 
+        if pd.isna(rsi) or rsi > 75: return None # RSI严重超买，今天进去大概率站岗
 
         consecutive_down = 0
         for i in range(2, 8):
@@ -519,7 +516,7 @@ def apply_scoring(data: dict, now: datetime) -> tuple[int, str, str]:
         Factor(lambda d: d['macd_dea'] >= -0.05, 8, 1.0, "🌊 【多头控盘】MACD处于强势零轴附近，没有深套风险"), 
         
         Factor(lambda d: 0 <= d['dist_ma20'] <= 4.0, 15, 1.0, "🧲 【贴地潜伏】目前价格紧贴20日支撑线，属于绝佳的安全低吸点，没追高"),
-        Factor(lambda d: 40 <= d.get('rsi', 50) <= 65, 10, 1.0, "📊 【温度适中】RSI指标健康，不冷不热正是下手好时机"),
+        Factor(lambda d: 40 <= d.get('rsi', 50) <= 62, 10, 1.0, "📊 【温度适中】RSI处于健康买入区间，不冷不热正是下手时机"),
         
         Factor(lambda d: d['bull_rank'], 10, 1.0, "📈 【顺势而为】均线多头排列，跟着主力资金大部队走"),
         Factor(lambda d: d['ma_convergence'], 12, 1.0, "🌪️ 【面临变盘】短期和长期成本几乎重合，随时向上爆发"), 
@@ -534,18 +531,18 @@ def apply_scoring(data: dict, now: datetime) -> tuple[int, str, str]:
         Factor(lambda d: d['has_obv_break'], 10, tw, "💸 【真金白银】模型监控到真实的机构资金在创纪录买入"),
         Factor(lambda d: d['has_pullback'], 15, 1.0, "🪃 【上车机会】温和缩量回踩，主力洗盘挖坑给的上车机会"),
         Factor(lambda d: d['lower_shadow_ratio'] > 0.03, 8, 1.0, "📌 【强力护盘】跌下去被大资金迅速买回，下方有人兜底"), 
-        Factor(lambda d: d['has_fund_inflow'], 12, tw, f"💰 【大单抢筹】发现主力大资金正在持续净流入"),
+        Factor(lambda d: d['has_fund_inflow'], 8, 1.0, "💰 【资金关注】监测到较大规模主力资金净流入（仅供参考，非100%可信）"),
         
         Factor(lambda d: d.get('sector_ok', False), 10, 1.0, "🌱 【板块温和】所属板块今日温和上涨，资金在悄悄布局而非疯狂追涨"),
         Factor(lambda d: 0.0 <= d.get('sector_pct', 0) <= 0.3, 5, 1.0, "⚖️ 【独立行情】所属板块表现平淡，全靠个股自身逻辑独立走强"),
         Factor(lambda d: 3.0 <= d.get('sector_pct', 0) < 5.0, 5, 1.0, "📈 【板块较热】板块涨幅较大，已吸引市场目光，可顺势参与但需防回调"),
         
-        Factor(lambda d: d.get('rs_rating', 0) > 5, 8, 1.0, "🏆 【相对强势】近60日涨幅跑赢大盘5%以上，属于市场里的强者"),
+        Factor(lambda d: d.get('rs_rating', 0) > 5,  8, 1.0, "🏆 【跑赢大盘】近60日涨幅超越指数，说明有资金在持续选择它"),
         
         # --- 【排雷扣分项】 ---
         Factor(lambda d: d.get('sector_overheated', False), -12, 1.0, "🌋 【板块过热】今日板块暴涨超5%，主力随时借机出货，小白此时入场风险极高(已扣分)"),
-        Factor(lambda d: d.get('rsi', 50) > 70, -12, 1.0, "🌡️ 【过热预警】RSI已超70超买线，买进去容易在高位站岗"),
-        Factor(lambda d: d.get('rs_rating', 0) < -10, -10, 1.0, "📉 【相对弱势】近期跑输大盘明显，跟的是一只被市场嫌弃的股"),
+        Factor(lambda d: d.get('rsi', 50) > 68, -10, 1.0, "🌡️ 【微过热】RSI偏高，短线超买迹象，操作需要更小的仓位"),
+        Factor(lambda d: d.get('rs_rating', 0) < -10, -8, 1.0, "📉 【跑输大盘】近期持续弱于大盘，跟的是被市场冷落的股票"),
         Factor(lambda d: d['has_consecutive_zt'] and d['price_pct'] < 0.40, 10, 1.0, "🔥🔥 【低位连板】刚刚启动的龙头，安全且辨识度高"),
         Factor(lambda d: d['has_consecutive_zt'] and d['price_pct'] >= 0.40, -20, 1.0, "⚠️ 【高位接盘】股价已被炒高连板，千万别追，容易接盘！"),
         Factor(lambda d: d['upper_shadow_pct'] > 18, -15, 1.0, "⚠️ 【诱多预警】冲高后大幅跳水，上方抛压极重，别上当"),
@@ -610,7 +607,7 @@ def process_stock(row: pd.Series, raw_hist: pd.DataFrame, now: datetime, market_
     data['mcap'] = float(row.get(C.S_MCAP, 0))
     data['vol_ratio'] = float(row.get(C.S_VR, 1.0))
     data['fund_flow_w'] = flow / 10000.0
-    data['has_fund_inflow'] = flow > max(1e7, float(row.get(C.S_MCAP, 0)) * 0.001)
+    data['has_fund_inflow'] = flow > max(3e7, float(row.get(C.S_MCAP, 0)) * 0.003)
     data['rs_rating'] = ((row[C.S_PRICE] / data['close_60d_ago'] - 1) * 100 - index_ret) if data['close_60d_ago'] > 0 else 0
     
     supports = [data['ma20_val'], data['recent_20_low'], data['boll_lower']]
@@ -913,6 +910,7 @@ def get_signals() -> tuple[list[Signal], list, set, int, str, int]:
                             reas += "\n" + margin_msg
                         
                         target1_price = round(row[C.S_PRICE]*(1+risk*2.5/100), 2)
+                        
                         money_msg = format_money_risk_msg(row[C.S_PRICE], stop, target1_price)
                         tranche_msg = generate_tranche_plan(row[C.S_PRICE], score, m_ok, m_overheated)
                         plan_b_msg = generate_plan_b(row[C.S_PRICE], stop, data['ma20_val'])
@@ -923,7 +921,7 @@ def get_signals() -> tuple[list[Signal], list, set, int, str, int]:
                             pct_chg=f"{row[C.S_PCT]}%", score=score, level=level,
                             trigger_time=now.strftime('%H:%M'), reasons=reas,
                             stop_loss=round(stop, 2), target1=target1_price,
-                            target2=round(data['max_1y'], 2), ma10=round(data['ma10_val'], 2),
+                            ma10=round(data['ma10_val'], 2),
                             sector=sector, sector_pct=s_pct,
                             money_risk_msg=money_msg, tranche_plan_msg=tranche_msg,
                             plan_b_msg=plan_b_msg, hold_period_msg=hold_msg
@@ -983,6 +981,19 @@ def send_dingtalk(signals: list[Signal], watchlist: list, total_pool: int, total
                 
             content = header + f"📈 **今日正式推送质量自检**：平均 {avg_score:.0f} 分 | {quality_tag}\n\n"
             
+            # ── 冷静门：在用户看到任何股票之前强制阅读 ──────────
+            cold_gate = (
+                "⏸️ ━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "📖 **买入前，请先做完这个自检（30秒）：**\n"
+                "   □ 我这笔钱3年内不会急用？\n"
+                "   □ 就算亏掉30%，我也不会睡不着觉？\n"
+                "   □ 我不会因为这只股跌了就反复刷手机？\n\n"
+                "   ✅ 三项全对 → 可以按计划操作\n"
+                "   ❌ 有一项不对 → 把计划买入金额砍掉一半，再看\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            )
+            content += cold_gate
+            
             parts = []
             for s in signals:
                 sec_info = f"🏷️ 热点板块：{s.sector} (今日 {s.sector_pct:+.2f}%)\n" if s.sector else ""
@@ -1022,12 +1033,6 @@ def send_dingtalk(signals: list[Signal], watchlist: list, total_pool: int, total
                 f"{watch_lines}\n"
                 f"以上标的当前评级为 B 级，系统判断波动或风险偏大，暂不提供操作剧本。仅作盘感追踪，待其评级升至 A 级后再考虑介入。"
             )
-        
-        content += (
-            "\n\n🤔 **买入前灵魂拷问：**\n"
-            "如果明天买入的股票跌了 5%，我会焦虑得睡不着觉吗？\n"
-            "→ 如果会，请把你准备买入的金额【再砍掉一半】！投资是为了生活更好，不是为了找罪受。"
-        )
 
     try:
         res = requests.post(webhook, json={'msgtype': 'text', 'text': {'content': content}}, timeout=10)

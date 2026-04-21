@@ -362,14 +362,23 @@ class AShareTechnicals:
         
         price_pct = (today[C.H_CLOSE] - min_1y) / rng
         
-        # 【限制放宽】：允许截取主升浪选手，最高分位由 0.65 放宽至 0.88
         if price_pct > 0.88: return None 
 
-        if today[C.H_CLOSE] < today['MA20']: return None
+        # 【限制放宽】容忍微跌破20日线的假摔洗盘（允许最大2%跌破），不再一刀切毙命
+        if today[C.H_CLOSE] < today['MA20'] * 0.98: return None
+        
         if not (today['DIF'] >= today['DEA'] or today['DIF'] > -0.1): return None
 
         rsi = float(today.get('RSI14', 50))
         if pd.isna(rsi) or rsi > 82: return None 
+
+        consecutive_down = 0
+        for i in range(2, 8):
+            if len(df) >= i and df[C.H_CLOSE].iloc[-i] < df[C.H_OPEN].iloc[-i]:
+                consecutive_down += 1
+            else:
+                break
+        # 【杀手清除】删除了 if consecutive_down >= 4: return None 物理阻断，交由打分引擎扣分
 
         ma_convergence = (abs(today['MA10'] - today['MA20']) / today['MA20'] < 0.03) and \
                          (abs(today['MA20'] - today['MA60']) / today['MA60'] < 0.05)
@@ -411,6 +420,7 @@ class AShareTechnicals:
             'dist_ma20': (today[C.H_CLOSE] / today['MA20'] - 1) * 100,
             'red_days': red_days,
             'rsi': rsi,
+            'consecutive_down': consecutive_down,
             'macd_dea': float(today['DEA']),
             'ma10_val': float(today['MA10']), 'ma20_val': float(today['MA20']), 'atr_val': float(today['ATR']),
             'low_val': float(today[C.H_LOW]), 'recent_20_low': float(df[C.H_LOW].iloc[-20:].min()),
@@ -437,14 +447,14 @@ def apply_scoring(data: dict, now: datetime) -> tuple[int, str, str]:
     factors = [
         Factor(lambda d: d['price_pct'] < 0.25, 15, rw, "🟢 【绝对低位】目前买入相当于抄底，长线拿着不慌"),
         Factor(lambda d: 0.25 <= d['price_pct'] <= 0.45, 10, 1.0, "🟢 【相对低位】刚刚从底部爬起来，输时间不输钱"),
-        # 【新增】：给中高位的多头股票赋予合理加分，使其能顺利突破及格线
         Factor(lambda d: 0.45 < d['price_pct'] <= 0.75, 8, 1.0, "🚀 【多头趋势】股价已脱离底部，处于健康的主升浪区间"),
         
         Factor(lambda d: d['pe'] > 0 and d['pe'] < 30, 8, 1.0, "🛡️ 【业绩护体】市盈率健康，不是炒空气的垃圾股"),
         Factor(lambda d: d['pb'] > 0 and d['pb'] < 1.2, 10, 1.0, "🧱 【跌无可跌】股价逼近变卖资产的净值，大盘暴跌它也不怕"), 
         Factor(lambda d: d['macd_dea'] >= -0.05, 8, 1.0, "🌊 【多头控盘】MACD处于强势零轴附近，没有深套风险"), 
         
-        Factor(lambda d: 0 <= d['dist_ma20'] <= 4.0, 15, 1.0, "🧲 【贴地潜伏】目前价格紧贴20日支撑线，属于绝佳的安全低吸点，没追高"),
+        Factor(lambda d: 0 <= d['dist_ma20'] <= 4.0, 15, 1.0, "🧲 【贴地潜伏】目前价格紧贴支撑线，属于绝佳的安全低吸点，没追高"),
+        Factor(lambda d: d['dist_ma20'] < 0, -10, 1.0, "⚠️ 【破位嫌疑】当前处于20日线下方，属于弱势反弹，需警惕冲高回落"),
         Factor(lambda d: 40 <= d.get('rsi', 50) <= 62, 10, 1.0, "📊 【温度适中】RSI处于健康买入区间，不冷不热正是下手时机"),
         
         Factor(lambda d: d['bull_rank'], 10, 1.0, "📈 【顺势而为】均线多头排列，跟着主力资金大部队走"),
@@ -468,7 +478,8 @@ def apply_scoring(data: dict, now: datetime) -> tuple[int, str, str]:
         Factor(lambda d: d.get('rs_rating', 0) > 5,  8, 1.0, "🏆 【跑赢大盘】近60日涨幅超越指数，说明有资金在持续选择它"),
         
         # --- 【排雷扣分项】 ---
-        Factor(lambda d: d.get('sector_overheated', False), -12, 1.0, "🌋 【板块过热】今日板块暴涨超5%，主力随时借机出货，小白此时入场风险极高(已扣分)"),
+        Factor(lambda d: d.get('consecutive_down', 0) >= 4, -15, 1.0, "🔪 【飞刀预警】近期出现连续阴线急跌，左侧接飞刀风险极大(已重度扣分)"),
+        Factor(lambda d: d.get('sector_overheated', False), -12, 1.0, "🌋 【板块过热】今日板块暴涨超5%，主力随时借机出货，风险极高(已扣分)"),
         Factor(lambda d: d.get('rsi', 50) > 75, -10, 1.0, "🌡️ 【微过热】RSI偏高，短线超买迹象，操作需要更小的仓位"),
         Factor(lambda d: d.get('rs_rating', 0) < -10, -8, 1.0, "📉 【跑输大盘】近期持续弱于大盘，跟的是被市场冷落的股票"),
         Factor(lambda d: d['has_consecutive_zt'] and d['price_pct'] < 0.40, 10, 1.0, "🔥🔥 【低位连板】刚刚启动的龙头，安全且辨识度高"),
@@ -476,10 +487,12 @@ def apply_scoring(data: dict, now: datetime) -> tuple[int, str, str]:
         Factor(lambda d: d['upper_shadow_pct'] > 18, -15, 1.0, "⚠️ 【诱多预警】冲高后大幅跳水，上方抛压极重，别上当"),
         Factor(lambda d: d['dist_ma20'] > 18, -20, 1.0, "🚫 【追高预警】目前涨得太急离均线太远，随时面临暴跌回调"),
         
-        Factor(lambda d: in_danger and d['mcap'] < 100e8, -15, 1.0, f"📅 【财报雷区】当前属于{danger_label}高危期，小盘股极易暴雷(已扣分)")
+        # 【限制放宽】大幅减轻对中小盘在财报季的无差别轰炸（-15 -> -8）
+        Factor(lambda d: in_danger and d['mcap'] < 100e8, -8, 1.0, f"📅 【财报防守】当前属于{danger_label}高危期，小盘股需防业绩变脸(已扣分)")
     ]
 
-    score, reasons = 40, [meta] if meta else []
+    # 【提升基础底仓分数】：由 40 抬高到 45，让优秀标的更容易越过 70 分及格线
+    score, reasons = 45, [meta] if meta else []
     
     for f in factors:
         if f.condition(data):
@@ -531,13 +544,17 @@ def process_stock(row: pd.Series, raw_hist: pd.DataFrame, now: datetime, market_
     data['vol_ratio'] = float(row.get(C.S_VR, 1.0))
     data['rs_rating'] = ((row[C.S_PRICE] / data['close_60d_ago'] - 1) * 100 - index_ret) if data['close_60d_ago'] > 0 else 0
     
-    supports = [data['ma20_val'], data['recent_20_low'], data['boll_lower']]
+    # 【修复重点】：将 MA10（10日线）加入有效支撑位判断！
+    # 对于走主升浪的趋势股，它们回踩的往往是10日线而不是20日线，这能彻底避免它们被误判为“高风险乖离”而惨遭枪毙！
+    supports = [data['ma10_val'], data['ma20_val'], data['recent_20_low'], data['boll_lower']]
     valid_supports = [s for s in supports if pd.notna(s) and s < row[C.S_PRICE]]
     
-    # 【限制放宽】容忍止损空间从原来的 7% 放宽到 11%，防止趋势票在洗盘回踩中被错误拦截
+    # 止损位：强力支撑位 或者 最多允许跌 12%
     stop = max(valid_supports + [row[C.S_PRICE] * 0.88]) * 0.993 
     risk_pct = ((row[C.S_PRICE] - stop) / row[C.S_PRICE]) * 100 if row[C.S_PRICE] > 0 else 99
-    if risk_pct > 11.0: return None 
+    
+    # 【限制放宽】硬性风控容忍度提升至 15.0%，不再轻易拦截右侧发车的主升浪品种
+    if risk_pct > 15.0: return None 
 
     return (data, stop, risk_pct) 
 
@@ -645,12 +662,12 @@ def get_signals() -> tuple[list[Signal], list, set, int, str, int]:
     if pool.empty: return [], [], pushed, len(df_clean), m_msg, len(df_clean)
     
     if len(pool) > 80:
-        # 【逻辑优化】：优先筛选今天温和起涨(0.5%~4.5%)的优质标的，而不是盲目挑成交额最庞大的巨无霸
-        ideal_mask = pool[C.S_PCT].between(0.5, 4.5)
-        if ideal_mask.sum() > 20:
+        # 【逻辑优化】：优先筛选今天温和波动的优质标的（涵盖假摔洗盘和稳步起涨），扩宽选池容错面
+        ideal_mask = pool[C.S_PCT].between(-1.0, 5.0)
+        if ideal_mask.sum() > 30:
             pool = pool[ideal_mask]
             
-        log.info(f"💡 触发防爆流截断，基于温和起涨优选策略，保留最活跃的 80 只标的参与决选。")
+        log.info(f"💡 触发防爆流截断，基于优选策略，保留最活跃的 80 只标的参与决选。")
         pool = pool.sort_values(by=C.S_AMT, ascending=False).head(80)
 
     confirmed_data = [] 

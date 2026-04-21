@@ -9,6 +9,7 @@ from functools import wraps
 from typing import Optional, Tuple, Callable
 
 import requests
+from requests.exceptions import RequestException
 import numpy as np
 import pandas as pd
 import pytz
@@ -102,7 +103,6 @@ class Config:
     MAX_PE: float        = field(default_factory=lambda: EnvParser.get_float('MAX_PE', 300))      
     MIN_TURNOVER: float  = field(default_factory=lambda: EnvParser.get_float('MIN_TURNOVER', 0.5))
     MAX_TURNOVER: float  = field(default_factory=lambda: EnvParser.get_float('MAX_TURNOVER', 25.0)) 
-    # 【修复致命拦截】：容忍洗盘跌幅，由 -1.0% 放宽到 -4.0%，否则错杀所有洗盘良机
     MIN_PCT_CHG: float   = field(default_factory=lambda: EnvParser.get_float('MIN_PCT_CHG', -4.0))  
     MIN_VOL_RATIO: float = field(default_factory=lambda: EnvParser.get_float('MIN_VOL_RATIO', 0.5))  
     MAX_VOL_RATIO: float = field(default_factory=lambda: EnvParser.get_float('MAX_VOL_RATIO', 15.0))
@@ -307,7 +307,7 @@ def fetch_spot() -> pd.DataFrame:
             fallback_defaults = {
                 C.S_TURN: 2.0,      
                 C.S_MCAP: 100e8,    
-                C.S_PE: -1.0,       # 【安全修复】：改为特殊的负数，防止垃圾股骗取8分业绩护体加分
+                C.S_PE: -1.0,       
                 C.S_PB: 2.0,        
                 C.S_VR: 1.0         
             }
@@ -326,7 +326,7 @@ class AShareTechnicals:
         close = self.df[C.H_CLOSE]
         high, low, vol = self.df[C.H_HIGH], self.df[C.H_LOW], self.df[C.H_VOL]
         
-        for span in (10, 20, 60):  # 【算力优化】：清理无效的 250日 年线遍历
+        for span in (10, 20, 60): 
             self.df[f'MA{span}'] = close.rolling(span).mean()
         self.df['MA5_V'] = vol.rolling(5).mean()
         self.df['MA20_V'] = vol.rolling(20).mean()
@@ -365,7 +365,6 @@ class AShareTechnicals:
         if price_pct > 0.96: return None 
         if today[C.H_CLOSE] < today['MA20'] * 0.95: return None
         
-        # 【修复拦截】：放宽洗盘票的 MACD DIF 限制，由 > -0.1 改为 > -0.25，允许适当的深度回调
         if not (today['DIF'] >= today['DEA'] or today['DIF'] > -0.25): return None
 
         rsi = float(today.get('RSI14', 50))
@@ -394,7 +393,6 @@ class AShareTechnicals:
             if df[C.H_CLOSE].iloc[-i] > df[C.H_OPEN].iloc[-i]: red_days += 1
             else: break
             
-        # 【算力优化】：删除了不再被任何逻辑使用的 body_pct 变量
         has_pullback = bool(
             today[C.H_CLOSE] >= today['MA20'] and 
             today[C.H_VOL] < today['MA5_V'] * 0.9 and
@@ -443,7 +441,7 @@ def apply_scoring(data: dict, now: datetime) -> tuple[int, str, str]:
 
     factors = [
         Factor(lambda d: d['mcap'] > 300e8 and 0 < d['pe'] < 25 and d['pb'] < 3, 12, 1.0, "🏢 【价值蓝筹】大市值低估值核心资产，防守属性极强"),
-        Factor(lambda d: str(d.get('code', '')).startswith('300') and d['vol_ratio'] > 1.2 and d['rs_rating'] > 5, 12, 1.0, "🚀 【弹性成长】创业板高弹性或资金高低切标的，接力意愿强"),
+        Factor(lambda d: str(d.get('code', '')).startswith('300') and d['vol_ratio'] > 1.2 and d['rs_rating'] > 5, 12, 1.0, "🚀 【弹性成长】创业板高弹性成长标的，接力意愿强"),
         Factor(lambda d: d['price_pct'] < 0.3 and 0 < d['pb'] < 1.0, 10, 1.0, "♻️ 【困境反转】股价严重破净且处于绝对低位，安全垫极厚"),
         
         Factor(lambda d: d['price_pct'] < 0.25, 15, rw, "🟢 【绝对低位】目前买入相当于抄底，长线拿着不慌"),
@@ -457,7 +455,6 @@ def apply_scoring(data: dict, now: datetime) -> tuple[int, str, str]:
         Factor(lambda d: 6.0 < d['dist_ma20'] <= 12.0, 8, 1.0, "🚀 【强势上攻】距离20日线有一定空间，依托10日线强势上攻"),
         Factor(lambda d: d['dist_ma20'] < 0, -10, 1.0, "⚠️ 【破位嫌疑】当前处于20日线下方，属于弱势反弹，需警惕冲高回落"),
         
-        # 【扩容】：涵盖超卖反弹洗盘的情况 (35~68)
         Factor(lambda d: 35 <= d.get('rsi', 50) <= 68, 10, 1.0, "📊 【温度适中】RSI处于健康买入区间，不冷不热正是下手时机"),
         
         Factor(lambda d: d['bull_rank'], 10, 1.0, "📈 【顺势而为】均线多头排列，跟着主力资金大部队走"),
@@ -474,15 +471,10 @@ def apply_scoring(data: dict, now: datetime) -> tuple[int, str, str]:
         Factor(lambda d: d['has_pullback'], 15, 1.0, "🪃 【上车机会】温和缩量回踩，主力洗盘挖坑给的上车机会"),
         Factor(lambda d: d['lower_shadow_ratio'] > 0.03, 8, 1.0, "📌 【强力护盘】跌下去被大资金迅速买回，下方有人兜底"), 
         
-        Factor(lambda d: d.get('sector_ok', False), 10, 1.0, "🌱 【板块温和】所属板块今日温和上涨，资金在悄悄布局而非疯狂追涨"),
-        Factor(lambda d: 0.0 <= d.get('sector_pct', 0) <= 0.3, 5, 1.0, "⚖️ 【独立行情】所属板块表现平淡，全靠个股自身逻辑独立走强"),
-        Factor(lambda d: 3.0 <= d.get('sector_pct', 0) < 5.0, 5, 1.0, "📈 【板块较热】板块涨幅较大，已吸引市场目光，可顺势参与但需防回调"),
-        
         Factor(lambda d: d.get('rs_rating', 0) > 5,  8, 1.0, "🏆 【跑赢大盘】近60日涨幅超越指数，说明有资金在持续选择它"),
         
         # --- 【排雷扣分项】 ---
         Factor(lambda d: d.get('consecutive_down', 0) >= 4, -15, 1.0, "🔪 【飞刀预警】近期出现连续阴线急跌，左侧接飞刀风险极大(已重度扣分)"),
-        Factor(lambda d: d.get('sector_overheated', False), -12, 1.0, "🌋 【板块过热】今日板块暴涨超5%，主力随时借机出货，风险极高(已扣分)"),
         Factor(lambda d: d.get('rsi', 50) > 80, -10, 1.0, "🌡️ 【微过热】RSI偏高，短线超买迹象，操作需要更小的仓位"),
         Factor(lambda d: d.get('rs_rating', 0) < -10, -8, 1.0, "📉 【跑输大盘】近期持续弱于大盘，跟的是被市场冷落的股票"),
         Factor(lambda d: d['has_consecutive_zt'] and d['price_pct'] < 0.40, 10, 1.0, "🔥🔥 【低位连板】刚刚启动的龙头，安全且辨识度高"),
@@ -533,7 +525,6 @@ def process_stock(row: pd.Series, raw_hist: pd.DataFrame, now: datetime, market_
         }])
         hist = pd.concat([hist, synthetic], ignore_index=True)
 
-    # 【修复致命拦截】：删除了 C.H_CLOSE <= C.H_OPEN 的阴线无条件抹杀，允许阴线低吸！
     if hist.iloc[-1][C.H_VOL] <= 0: return None
     
     engine = AShareTechnicals(hist)
@@ -601,7 +592,7 @@ def extract_market_context(df_raw: pd.DataFrame, c_conf: Config) -> tuple[pd.Dat
             advice = "🛡️ 弱势震荡市 (建议仓位 20%-40%)，控制手管住回撤，非绝对低位不买。"
 
         fallback_warning = ""
-        if C.S_PE in df_raw.columns and (df_raw[C.S_PE] == -1.0).sum() > len(df_raw) * 0.9:  # 【同步修复】：判定条件同步改为 -1.0
+        if C.S_PE in df_raw.columns and (df_raw[C.S_PE] == -1.0).sum() > len(df_raw) * 0.9: 
             fallback_warning = "\n\n⚠️ **【系统数据源降级警报】**\n今日自动切换至备用数据源。**基本面过滤(市盈率/量比等)暂时失效**，请自行排雷！"
 
         market_msg = (
@@ -627,7 +618,7 @@ def get_signals() -> tuple[list[Signal], list, set, int, str, int]:
     if not IS_MANUAL and not is_valid_run_time(now): 
         return [], [], set(), 0, "", 0
 
-    pushed = load_pushed_state() # 【修复笔误】：移除 c_conf 错误赋值
+    pushed = load_pushed_state() 
 
     try:
         df_raw = fetch_spot()
@@ -661,7 +652,6 @@ def get_signals() -> tuple[list[Signal], list, set, int, str, int]:
     if pool.empty: return [], [], pushed, len(df_clean), m_msg, len(df_clean)
     
     if len(pool) > 150:
-        # 【扩容】：允许跌幅达到 -4.0% 的股票进入优选池，接纳洗盘动作！
         ideal_mask = pool[C.S_PCT].between(-4.0, 6.0)
         if ideal_mask.sum() > 30:
             pool = pool[ideal_mask]
@@ -685,13 +675,6 @@ def get_signals() -> tuple[list[Signal], list, set, int, str, int]:
                 result = process_stock(row, hist, now, m_ok, idx_ret)
                 if result:
                     data, stop, risk = result
-                    s_pct = 0.0 
-                    data.update({
-                        'sector': "", 
-                        'sector_pct': s_pct, 
-                        'sector_ok': False,
-                        'sector_overheated': False
-                    })
                     
                     score, level, reas = apply_scoring(data, now)
                     
@@ -758,11 +741,16 @@ def send_dingtalk(signals: list[Signal], watchlist: list, total_pool: int, total
         content = f"{header}✅ 安全雷达体检未发现完全符合安全边际的优质股，别乱买，我们空仓防守！"
     else:
         if signals:
-            avg_score = sum(s.score for s in signals) / len(signals)
+            # 【核心安全机制】：钉钉 Markdown 限制 20KB，强制截取 Top 5 进行全量图文推送
+            MAX_DISPLAY = 5
+            display_signals = signals[:MAX_DISPLAY]
+            hidden_count = len(signals) - len(display_signals)
+            
+            avg_score = sum(s.score for s in display_signals) / len(display_signals)
             quality_tag = "🥇 信号质量优秀，可按剧本布局" if avg_score >= 80 \
                 else "🥈 信号质量尚可，需严格限价且减半仓位"
                 
-            content = header + f"### 📈 今日正式推送质量自检\n**平均 {avg_score:.0f} 分 | {quality_tag}**\n\n"
+            content = header + f"### 📈 今日正式推送质量自检\n**核心精选平均 {avg_score:.0f} 分 | {quality_tag}**\n\n"
             
             cold_gate = (
                 "> ⏸️ ━━━━━━━━━━━━━━━━━━━━\n"
@@ -777,7 +765,7 @@ def send_dingtalk(signals: list[Signal], watchlist: list, total_pool: int, total
             content += cold_gate
             
             parts = []
-            for s in signals:
+            for s in display_signals:
                 warn_msg = "⚡ **【风险警示】**：该股为创业板(波动±20%)，心脏不好的务必把买入金额砍半！\n\n" if str(s.code).startswith('300') else ""
                 prefix = '1' if str(s.code).startswith('6') else '0'
                 tdx_market = 'SH' if str(s.code).startswith('6') else 'SZ' 
@@ -804,8 +792,12 @@ def send_dingtalk(signals: list[Signal], watchlist: list, total_pool: int, total
                     f"🔗 通达信快捷看盘：复制代码 `{s.code}` 后直接打开通达信App即可弹出\n"
                 )
             content += "\n---\n".join(parts)
+            
+            if hidden_count > 0:
+                content += f"\n\n---\n*⚠️ 受限于钉钉单条消息的字数上限，本次还有 **{hidden_count} 只** 达标个股已被系统自动折叠。请优先关注上方排名前列的核心标的！*"
+                
         else:
-            content = header + "✅ 今日未发现 B+ 级以上机会，正式推荐列表空仓防守中。\n"
+            content = header + "✅ 今日未发现 B+ 级以上核心机会，正式推荐列表空仓防守中。\n"
 
         if watchlist:
             watch_lines = "\n".join(

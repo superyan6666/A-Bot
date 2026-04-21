@@ -334,58 +334,6 @@ def fetch_spot() -> pd.DataFrame:
         raise
     raise ValueError('spot_empty')
 
-def get_fund_flow_map() -> dict:
-    try:
-        df = ak.stock_individual_fund_flow_rank(indicator="今日")
-        if df is None or df.empty: return {}
-        priority_targets = ['主力净流入-净额', '今日主力净流入净额', '主力净流入净额']
-        col = next((c for c in priority_targets if c in df.columns), None)
-        if not col:
-            col = next((c for c in df.columns if '主力净流入' in c and '净额' in c), None)
-        if not col: return {}
-        return dict(zip(df[C.S_CODE], pd.to_numeric(df[col], errors='coerce').fillna(0.0)))
-    except Exception:
-        return {}
-
-@retry(times=2, delay=1)
-def check_shareholder_risk(code: str) -> tuple[bool, str]:
-    try:
-        df_pledge = ak.stock_zh_a_gdhs(symbol=code) 
-        if df_pledge is not None and not df_pledge.empty:
-            pledge_col = next((c for c in df_pledge.columns if '质押' in c or '比例' in c), None)
-            if pledge_col:
-                pledge_ratio = pd.to_numeric(df_pledge[pledge_col].iloc[0], errors='coerce')
-                if pd.notna(pledge_ratio) and pledge_ratio > 50:
-                    return False, f"💣 股权质押高达 {pledge_ratio:.1f}%，爆仓强平风险极大，拒绝碰瓷！"
-    except Exception as e:
-        log.debug(f"质押数据查询跳过({code}): 接口波动或无数据 {e}")
-    return True, ""
-
-@retry(times=2, delay=1)
-def check_margin_crowding(code: str, mcap: float) -> str:
-    try:
-        prefix = 'sh' if str(code).startswith('6') else 'sz'
-        df = ak.stock_margin_detail_szse(date=datetime.now(TZ_BJS).strftime('%Y%m%d')) if prefix == 'sz' else ak.stock_margin_detail_sse(date=datetime.now(TZ_BJS).strftime('%Y%m%d'))
-        if df is None or df.empty: return ""
-        
-        row = df[df['证券代码'] == code] if '证券代码' in df.columns else df[df['信用交易担保物'] == code]
-        if row.empty: return ""
-        
-        margin_balance_col = next((c for c in row.columns if '融资余额' in c), None)
-        if not margin_balance_col: return ""
-        
-        latest_margin = pd.to_numeric(row[margin_balance_col].iloc[0], errors='coerce')
-        if pd.isna(latest_margin) or mcap <= 0: return ""
-        
-        crowding_ratio = latest_margin / mcap * 100
-        if crowding_ratio > 4.0:
-            return f"🚨 融资盘高度拥挤({crowding_ratio:.1f}%)！散户全在借钱杠杆买，极易发生踩踏！"
-        elif crowding_ratio > 2.5:
-            return f"⚠️ 融资杠杆资金较多({crowding_ratio:.1f}%)，持股会有颠簸。"
-    except Exception as e:
-        log.debug(f"融资融券数据查询跳过({code}): 接口波动或无数据 {e}")
-    return ""
-
 
 # ── 5. A 股指标引擎 (Indicator Engine) ─────────────────────────────────────────
 class AShareTechnicals:
@@ -531,7 +479,6 @@ def apply_scoring(data: dict, now: datetime) -> tuple[int, str, str]:
         Factor(lambda d: d['has_obv_break'], 10, tw, "💸 【真金白银】模型监控到真实的机构资金在创纪录买入"),
         Factor(lambda d: d['has_pullback'], 15, 1.0, "🪃 【上车机会】温和缩量回踩，主力洗盘挖坑给的上车机会"),
         Factor(lambda d: d['lower_shadow_ratio'] > 0.03, 8, 1.0, "📌 【强力护盘】跌下去被大资金迅速买回，下方有人兜底"), 
-        Factor(lambda d: d['has_fund_inflow'], 8, 1.0, "💰 【资金关注】监测到较大规模主力资金净流入（仅供参考，非100%可信）"),
         
         Factor(lambda d: d.get('sector_ok', False), 10, 1.0, "🌱 【板块温和】所属板块今日温和上涨，资金在悄悄布局而非疯狂追涨"),
         Factor(lambda d: 0.0 <= d.get('sector_pct', 0) <= 0.3, 5, 1.0, "⚖️ 【独立行情】所属板块表现平淡，全靠个股自身逻辑独立走强"),
@@ -584,7 +531,7 @@ def is_valid_run_time(now: datetime) -> bool:
     t = now.hour * 100 + now.minute
     return t >= 1505
 
-def process_stock(row: pd.Series, raw_hist: pd.DataFrame, now: datetime, market_ok: bool, index_ret: float, flow: float) -> Optional[tuple]:
+def process_stock(row: pd.Series, raw_hist: pd.DataFrame, now: datetime, market_ok: bool, index_ret: float) -> Optional[tuple]:
     if len(raw_hist) < 250: return None
     
     hist = raw_hist.copy()
@@ -606,8 +553,6 @@ def process_stock(row: pd.Series, raw_hist: pd.DataFrame, now: datetime, market_
     data['pb'] = float(row.get(C.S_PB, 0))
     data['mcap'] = float(row.get(C.S_MCAP, 0))
     data['vol_ratio'] = float(row.get(C.S_VR, 1.0))
-    data['fund_flow_w'] = flow / 10000.0
-    data['has_fund_inflow'] = flow > max(3e7, float(row.get(C.S_MCAP, 0)) * 0.003)
     data['rs_rating'] = ((row[C.S_PRICE] / data['close_60d_ago'] - 1) * 100 - index_ret) if data['close_60d_ago'] > 0 else 0
     
     supports = [data['ma20_val'], data['recent_20_low'], data['boll_lower']]
@@ -822,32 +767,17 @@ def get_signals() -> tuple[list[Signal], list, set, int, str, int]:
         market_msg = extract_pure_market_context()
         return [], [], pushed, 0, market_msg, 0
     
-    ex1 = ThreadPoolExecutor(max_workers=2)
-    f_spot = ex1.submit(fetch_spot)
-    f_flow = ex1.submit(get_fund_flow_map)
-    
     df_raw = pd.DataFrame()
-    flow_map = {}
     
     try:
-        # 核心横截面数据，允许 60 秒超时宽限
-        df_raw = f_spot.result(timeout=60) 
+        # 直接拉取横截面数据（移除容易超时的资金流）
+        df_raw = fetch_spot()
     except Exception as e:
         log.error(f"❌ 核心横截面行情获取失败: {e}")
-        ex1.shutdown(wait=False, cancel_futures=True)
         # 【优雅降级】：即使个股数据挂了，也要调用纯大盘指数测算，绝不让小白只看到干瘪的报错
         fallback_msg = extract_pure_market_context()
         m_msg = f"⚠️ **东方财富个股接口异常，今日自动降级为纯大盘体检：**\n\n{fallback_msg}"
         return [], [], pushed, 0, m_msg, 0
-
-    try:
-        # 资金流是辅助指标(极其容易超时)，单独隔离异常！允许失败降级，绝不影响主流程
-        flow_map = f_flow.result(timeout=20)
-    except Exception as e:
-        log.warning(f"⚠️ 主力资金流辅助数据获取超时，自动降级跳过: {e}")
-        flow_map = {}
-        
-    ex1.shutdown(wait=False, cancel_futures=True)
 
     df_clean, m_ok, m_msg, idx_ret, m_overheated = extract_market_context(df_raw, c_conf)
     if df_clean.empty:
@@ -884,7 +814,7 @@ def get_signals() -> tuple[list[Signal], list, set, int, str, int]:
             row = futures[f]
             try:
                 hist = f.result(timeout=5)
-                result = process_stock(row, hist, now, m_ok, idx_ret, flow_map.get(row[C.S_CODE], 0.0))
+                result = process_stock(row, hist, now, m_ok, idx_ret)
                 if result:
                     data, stop, risk = result
                     sector = fetch_stock_sector(row[C.S_CODE])
@@ -900,16 +830,6 @@ def get_signals() -> tuple[list[Signal], list, set, int, str, int]:
                     
                     # ── 分流处理 ──
                     if score >= 75: 
-                        # AS 级：执行深度的风险审查并准备推送
-                        sh_safe, sh_msg = check_shareholder_risk(row[C.S_CODE])
-                        if not sh_safe:
-                            log.info(f"🚫 {row[C.S_NAME]} 被极度危险护盾拦截: {sh_msg}")
-                            continue 
-                            
-                        margin_msg = check_margin_crowding(row[C.S_CODE], data['mcap'])
-                        if margin_msg:
-                            reas += "\n" + margin_msg
-                        
                         target1_price = round(row[C.S_PRICE]*(1+risk*2.5/100), 2)
                         
                         money_msg = format_money_risk_msg(row[C.S_PRICE], stop, target1_price)

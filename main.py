@@ -221,7 +221,7 @@ def generate_tranche_plan(price: float, score: int, market_ok: bool, market_over
         f"📋 **明日操作计划（今晚设好条件单，明天不用盯盘）**\n"
         f"   ① 【挂单埋伏】以 ¥{limit_price} 限价挂买入 {t1}% 仓位，成交了就等，没成交就算\n"
         f"   ② 【稳健加仓】如果明后天没跌且站稳 ¥{add_price}，再加 {t2}%\n"
-        f"   ③ 【追击确认】如果继续上涨突破 ¥{break2}，最后追加 {t3}%\n"
+        f"   ③ 【追击确认】如果继续上涨突破 ¥{stop_add}，最后追加 {t3}%\n"
         f"   🔒 铁律：限价单没成交 → 不追市价！宁可踏空，绝不接盘高位。"
     )
 
@@ -679,17 +679,25 @@ def extract_market_context(df_raw: pd.DataFrame, c_conf: Config) -> tuple[pd.Dat
             advice = "🛡️ 弱势震荡市 (建议仓位 20%-40%)，控制手管住回撤，非绝对低位不买。"
 
         market_msg = (
-            f"🎯 上证指数: {cl.iloc[-1]:.2f} (今日 {pct:+.2f}%)，{'🟢 运行于 MA20 均线之上' if market_ok else '🔴 跌破 MA20 生命线'}\n"
-            f"🌡️ 市场情绪: 上涨 {up_count} 家 / 下跌 {down_count} 家 (涨停 {zt_count} / 跌停 {dt_count}){sentiment_addon}\n"
-            f"💰 实时量能: 两市总成交额约 {total_amt:.0f} 亿元\n"
-            f"💡 总体仓位策略: {advice}"
+            f"🎯 **指数收盘态势**:\n"
+            f"   • 上证指数: {cl.iloc[-1]:.2f} ({sh_pct:+.2f}%)\n"
+            f"   • 深证成指: {sz_df['close'].iloc[-1]:.2f} ({sz_pct:+.2f}%)\n"
+            f"   • 创业板指: {cyb_df['close'].iloc[-1]:.2f} ({cyb_pct:+.2f}%)\n"
+            f"💰 **全市场量能**: 两市总成交 {total_amt:.0f} 亿元 (较上日 {amt_diff:+.0f} 亿)\n"
+            f"📈 **主板技术面**:\n"
+            f"   • 趋势: {'🟢 企稳于MA20生命线' if market_ok else '🔴 跌破MA20生命线'}，大级别呈{trend_status}。\n"
+            f"   • 动能: MACD{macd_status}，短期呈现{amt_status}{'反弹' if sh_pct > 0 else '调整'}。\n"
+            f"   • 空间: 近期支撑 {recent_low:.0f} 点 | 压力 {recent_high:.0f} 点。\n"
+            f"🧠 **AI 深度形态解盘**:\n"
+            f"   • {insights_str}\n\n"
+            f"{plain_summary}\n\n"
+            f"💡 **总体仓位建议**: {advice}{fallback_warning}"
         )
     except Exception as e:
         log.warning(f"宏观状态解析失败: {e}")
-
-    df = df_raw.dropna(subset=list(c_conf.REQUIRED_COLS))
-    df = df[~df[C.S_NAME].str.contains('ST|退')]
-    return df, market_ok, market_msg, index_ret, market_overheated
+        market_msg = f"大盘深度解析由于网络原因失败: {e}\n"
+    
+    return df, market_ok, market_msg, index_ret, market_overheated # 注意这里返回df_raw，后续会过滤
 
 def extract_pure_market_context() -> str:
     """完全短路横截面的纯指数深度体检"""
@@ -781,11 +789,6 @@ def extract_pure_market_context() -> str:
         else:
             advice = "🛡️ 指数失守MA20呈空头排列，弱势区间风险大 (建议总仓位 10%-30%)，防守为主，不要轻易抄底。"
 
-        # ── 新增：检测是否触发了新浪备用源的优雅降级 ──
-        fallback_warning = ""
-        if C.S_PE in df_raw.columns and (df_raw[C.S_PE] == 15.0).sum() > len(df_raw) * 0.9:
-            fallback_warning = "\n\n⚠️ **【系统数据源降级警报】**\n由于主数据源网络拥堵，今日自动切换至备用数据源。**基本面过滤(市盈率/市净率/量比等)暂时失效**，请自行检查个股是否亏损或带雷！"
-
         market_msg = (
             f"🎯 **指数收盘态势**:\n"
             f"   • 上证指数: {cl.iloc[-1]:.2f} ({sh_pct:+.2f}%)\n"
@@ -799,15 +802,20 @@ def extract_pure_market_context() -> str:
             f"🧠 **AI 深度形态解盘**:\n"
             f"   • {insights_str}\n\n"
             f"{plain_summary}\n\n"
-            f"💡 **总体仓位建议**: {advice}{fallback_warning}"
+            f"💡 **总体仓位建议**: {advice}"
         )
     except Exception as e:
-        log.warning(f"宏观状态解析失败: {e}")
+        log.warning(f"大盘基准获取失败: {e}")
         market_msg = f"大盘深度解析由于网络原因失败: {e}\n"
     
-    return df_raw, market_ok, market_msg, index_ret, market_overheated # 注意这里返回df_raw，后续会过滤
+    return market_msg
 
-def extract_pure_market_context() -> str:
+def get_signals() -> tuple[list[Signal], list, set, int, str, int]:
+    now = datetime.now(TZ_BJS)
+    run_mode = os.environ.get('RUN_MODE', 'normal')
+    
+    log.info('🚀 防呆长线安全级·盘后复盘引擎启动...')
+    if not IS_MANUAL and not is_valid_run_time(now): 
         return [], [], set(), 0, "", 0
 
     c_conf, pushed = Config(), load_pushed_state()

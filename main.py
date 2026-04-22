@@ -2,6 +2,7 @@ import os
 import time
 import json
 import socket
+import random
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -17,6 +18,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as
 # ── 1. 环境与日志配置 ──────────────────────────────────────────────────────────
 TZ_BJS       = pytz.timezone('Asia/Shanghai')
 STATE_FILE   = 'pushed_state.json'
+SPOT_CACHE   = 'spot_cache.pkl'  # 【新增】全市场快照本地缓存文件
 IS_MANUAL    = os.environ.get('GITHUB_EVENT_NAME') == 'workflow_dispatch'
 PUSH_EMPTY   = os.environ.get('PUSH_EMPTY_RESULT', 'true').lower() in ('true', '1', 'yes')
 
@@ -298,14 +300,31 @@ def fetch_hist(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
         raise
     raise ValueError('history_empty')
 
-@retry(times=3, delay=2)
+@retry(times=3, delay=5)  # 增加重试的间隔时间，给东财WAF喘息机会
 def fetch_spot() -> pd.DataFrame:
+    # 【新增功能：缓存机制防封锁】频繁测试时，如果在2小时内已有快照，直接读取本地缓存，不再请求东财服务器
+    if os.path.exists(SPOT_CACHE):
+        mtime = os.path.getmtime(SPOT_CACHE)
+        if time.time() - mtime < 3600 * 2:  # 缓存有效期 2 小时
+            try:
+                log.info("📦 检测到本地有效缓存，跳过全量接口请求，直接极速加载...")
+                return pd.read_pickle(SPOT_CACHE)
+            except Exception as e:
+                log.debug(f"缓存读取失败，将重新请求: {e}")
+
     try:
+        # 防护抖动：首次请求前随机暂停，防止 GitHub Action 的规律性发包被秒封
+        time.sleep(random.uniform(1.0, 3.0))
         df = ak.stock_zh_a_spot_em()
         if df is not None and not df.empty:
+            try:
+                df.to_pickle(SPOT_CACHE)  # 成功后写入缓存
+            except Exception:
+                pass
             return df
     except Exception as e:
-        log.warning(f"行情主接口严重异常: {e}，正在启动新浪备用源并执行优雅降级...")
+        log.warning(f"行情主接口严重异常: {e}，频繁测试可能触发了东方财富的临时IP封禁限制。")
+        log.warning("正在启动新浪备用源并执行优雅降级...")
         df = ak.stock_zh_a_spot()
         if df is not None and not df.empty:
             rename_map = {'代码': C.S_CODE, '名称': C.S_NAME, '最新价': C.S_PRICE,
@@ -599,7 +618,7 @@ def extract_market_context(df_raw: pd.DataFrame, c_conf: Config) -> tuple[pd.Dat
 
         fallback_warning = ""
         if C.S_PE in df_raw.columns and (df_raw[C.S_PE] == -1.0).sum() > len(df_raw) * 0.9: 
-            fallback_warning = "\n\n> ⚠️ **数据源降级警报**\n> 东方财富接口异常，自动切至新浪备用源。市盈率等基本面过滤暂时失效，请自行排雷！"
+            fallback_warning = "\n\n> ⚠️ **数据源降级警报**\n> 频繁测试触发东方财富接口临时限制，已切至新浪备用源。基本面过滤(市盈率等)暂时失效，请自行排雷！"
 
         market_msg = (
             f"### 📊 大盘深度体检\n"
@@ -678,7 +697,6 @@ def get_signals() -> tuple[list[Signal], list, set, int, str, int]:
     futures = {ex2.submit(fetch_hist, r[C.S_CODE], start_s, end_s): r for _, r in pool.iterrows()}
     
     try:
-        # 【终极算力解绑】：配合 GitHub Actions 的 30 分钟额度，将内部多线程强制熔断时间从 4 分钟放宽到 20 分钟（1200秒）
         for f in as_completed(futures, timeout=1200): 
             row = futures[f]
             try:

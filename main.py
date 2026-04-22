@@ -97,11 +97,13 @@ class EnvParser:
 class Config:
     MIN_CAP: float       = field(default_factory=lambda: EnvParser.get_float('MIN_CAP', 30e8)) 
     MAX_CAP: float       = field(default_factory=lambda: EnvParser.get_float('MAX_CAP', 2000e8))
-    MAX_PRICE: float     = field(default_factory=lambda: EnvParser.get_float('MAX_PRICE', 60.0))  
+    # 【致命修复】：接纳百元优质龙头股，上限从 60 提至 500！
+    MAX_PRICE: float     = field(default_factory=lambda: EnvParser.get_float('MAX_PRICE', 500.0))  
     MIN_PE: float        = field(default_factory=lambda: EnvParser.get_float('MIN_PE', 0))    
     MAX_PE: float        = field(default_factory=lambda: EnvParser.get_float('MAX_PE', 300))      
     MIN_TURNOVER: float  = field(default_factory=lambda: EnvParser.get_float('MIN_TURNOVER', 0.5))
-    MAX_TURNOVER: float  = field(default_factory=lambda: EnvParser.get_float('MAX_TURNOVER', 25.0)) 
+    # 【放宽】：包容极端高换手的妖股
+    MAX_TURNOVER: float  = field(default_factory=lambda: EnvParser.get_float('MAX_TURNOVER', 40.0)) 
     MIN_PCT_CHG: float   = field(default_factory=lambda: EnvParser.get_float('MIN_PCT_CHG', -4.0))  
     MIN_VOL_RATIO: float = field(default_factory=lambda: EnvParser.get_float('MIN_VOL_RATIO', 0.5))  
     MAX_VOL_RATIO: float = field(default_factory=lambda: EnvParser.get_float('MAX_VOL_RATIO', 15.0))
@@ -370,7 +372,10 @@ class AShareTechnicals:
         
         price_pct = (today[C.H_CLOSE] - min_1y) / rng
         
-        if today[C.H_CLOSE] < today['MA20'] * 0.90: return None
+        # 【致命杀手移除完毕】：不再强行拦截 price_pct > 0.96 (主升浪) 和 DIF 绝对值
+        
+        # 【物理限制放宽】：最低门槛放宽至 20日线下方 15%，完全接纳极致的深蹲诱空洗盘
+        if today[C.H_CLOSE] < today['MA20'] * 0.85: return None
 
         rsi = float(today.get('RSI14', 50))
         if pd.isna(rsi) or rsi > 85: return None 
@@ -451,7 +456,9 @@ def apply_scoring(data: dict, now: datetime) -> tuple[int, str, str]:
         
         Factor(lambda d: d['price_pct'] < 0.25, 12, rw, "- 🟢 **绝对低位**：目前买入相当于抄底，长线持有安全"),
         Factor(lambda d: 0.25 <= d['price_pct'] <= 0.45, 8, 1.0, "- 🟢 **相对低位**：刚刚从底部爬起来，输时间不输钱"),
-        Factor(lambda d: d['price_pct'] > 0.45, 6, 1.0, "- 📈 **多头趋势**：股价已脱离底部，处于健康的主升浪区间"),
+        Factor(lambda d: 0.45 < d['price_pct'] <= 0.85, 6, 1.0, "- 📈 **多头趋势**：股价已脱离底部，处于健康的主升浪区间"),
+        # 【新增顺势奖励】：给予创出新高的顶级龙头破高奖励
+        Factor(lambda d: d['price_pct'] > 0.85, 8, 1.0, "- 🚀 **高位突破**：股价处于年度高位，强者恒强趋势极佳"), 
         
         Factor(lambda d: d['pe'] > 0 and d['pe'] < 40, 5, 1.0, "- 🛡️ **业绩护体**：市盈率健康，不是炒空气的无基本面股"),
         Factor(lambda d: d['macd_dea'] >= -0.05, 5, 1.0, "- 🌊 **多头控盘**：大周期趋势仍强，没有被深套的风险"), 
@@ -655,7 +662,7 @@ def get_signals() -> tuple[list[Signal], list, set, int, str, int]:
            (df_clean[C.S_MCAP].between(c_conf.MIN_CAP, c_conf.MAX_CAP)) & \
            (df_clean[C.S_TURN].between(c_conf.MIN_TURNOVER, c_conf.MAX_TURNOVER)) & \
            pe_cond & (df_clean[C.S_PE] <= c_conf.MAX_PE) & \
-           (df_clean[C.S_PB] > 0) & (df_clean[C.S_PB] <= 10.0) & \
+           (df_clean[C.S_PB] > 0) & (df_clean[C.S_PB] <= 30.0) & \
            (~df_clean[C.S_CODE].str.startswith(('688', '8', '4', '9'))) & \
            (df_clean[C.S_HIGH] > df_clean[C.S_LOW]) 
     
@@ -797,13 +804,12 @@ def send_dingtalk(signals: list[Signal], watchlist: list, total_pool: int, total
                     f"> **纪律红线**\n"
                     f"> 🎯 **止盈**：收盘跌破 `¥{s.ma10}` (10日线)，立刻卖出一半保住利润！\n"
                     f"> 🚫 **防守**：明日开盘直接高开 **> 4%** 说明资金抢跑，直接放弃，绝不追高！\n\n"
-                    f"🔗 [点击跳转东方财富 App 查阅详情](https://quote.eastmoney.com/unify/r/{prefix}.{s.code})\n\n"
+                    f"[🔗 点击跳转东方财富 App 查阅详情](https://quote.eastmoney.com/unify/r/{prefix}.{s.code})\n\n"
                     f"*📌 通达信看盘助手：复制代码 `{s.code}` 后打开通达信 App 即可弹出*"
                 )
             content += "\n\n---\n\n".join(parts)
             
             if hidden_count > 0:
-                # 【优化新增】：折叠区自带分数并默认已实现严格降序排序
                 hidden_names = "、".join([f"{s.name}(`{s.code}` **{s.score}分**)" for s in signals[MAX_DISPLAY:]])
                 content += f"\n\n---\n*⚠️ 受限于篇幅，以下 **{hidden_count} 只** 达标个股被系统折叠（已按分数排序）：*\n> {hidden_names}"
                 

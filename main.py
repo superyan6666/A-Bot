@@ -97,12 +97,10 @@ class EnvParser:
 class Config:
     MIN_CAP: float       = field(default_factory=lambda: EnvParser.get_float('MIN_CAP', 30e8)) 
     MAX_CAP: float       = field(default_factory=lambda: EnvParser.get_float('MAX_CAP', 2000e8))
-    # 【致命修复】：接纳百元优质龙头股，上限从 60 提至 500！
     MAX_PRICE: float     = field(default_factory=lambda: EnvParser.get_float('MAX_PRICE', 500.0))  
     MIN_PE: float        = field(default_factory=lambda: EnvParser.get_float('MIN_PE', 0))    
     MAX_PE: float        = field(default_factory=lambda: EnvParser.get_float('MAX_PE', 300))      
     MIN_TURNOVER: float  = field(default_factory=lambda: EnvParser.get_float('MIN_TURNOVER', 0.5))
-    # 【放宽】：包容极端高换手的妖股
     MAX_TURNOVER: float  = field(default_factory=lambda: EnvParser.get_float('MAX_TURNOVER', 40.0)) 
     MIN_PCT_CHG: float   = field(default_factory=lambda: EnvParser.get_float('MIN_PCT_CHG', -4.0))  
     MIN_VOL_RATIO: float = field(default_factory=lambda: EnvParser.get_float('MIN_VOL_RATIO', 0.5))  
@@ -372,9 +370,6 @@ class AShareTechnicals:
         
         price_pct = (today[C.H_CLOSE] - min_1y) / rng
         
-        # 【致命杀手移除完毕】：不再强行拦截 price_pct > 0.96 (主升浪) 和 DIF 绝对值
-        
-        # 【物理限制放宽】：最低门槛放宽至 20日线下方 15%，完全接纳极致的深蹲诱空洗盘
         if today[C.H_CLOSE] < today['MA20'] * 0.85: return None
 
         rsi = float(today.get('RSI14', 50))
@@ -456,8 +451,7 @@ def apply_scoring(data: dict, now: datetime) -> tuple[int, str, str]:
         
         Factor(lambda d: d['price_pct'] < 0.25, 12, rw, "- 🟢 **绝对低位**：目前买入相当于抄底，长线持有安全"),
         Factor(lambda d: 0.25 <= d['price_pct'] <= 0.45, 8, 1.0, "- 🟢 **相对低位**：刚刚从底部爬起来，输时间不输钱"),
-        Factor(lambda d: 0.45 < d['price_pct'] <= 0.85, 6, 1.0, "- 📈 **多头趋势**：股价已脱离底部，处于健康的主升浪区间"),
-        # 【新增顺势奖励】：给予创出新高的顶级龙头破高奖励
+        Factor(lambda d: d['price_pct'] > 0.45, 6, 1.0, "- 📈 **多头趋势**：股价已脱离底部，处于健康的主升浪区间"),
         Factor(lambda d: d['price_pct'] > 0.85, 8, 1.0, "- 🚀 **高位突破**：股价处于年度高位，强者恒强趋势极佳"), 
         
         Factor(lambda d: d['pe'] > 0 and d['pe'] < 40, 5, 1.0, "- 🛡️ **业绩护体**：市盈率健康，不是炒空气的无基本面股"),
@@ -497,7 +491,6 @@ def apply_scoring(data: dict, now: datetime) -> tuple[int, str, str]:
         Factor(lambda d: in_danger and d['mcap'] < 100e8, -8, 1.0, f"- 📅 **财报防雷**：当前属于{danger_label}，小盘股需防业绩变脸 (扣分)")
     ]
 
-    # 【去水分通胀】：底分降至 45分，拉开普通好股和完美牛股的分数断层
     score, reasons = 45, [meta] if meta else []
     
     for f in factors:
@@ -685,7 +678,8 @@ def get_signals() -> tuple[list[Signal], list, set, int, str, int]:
     futures = {ex2.submit(fetch_hist, r[C.S_CODE], start_s, end_s): r for _, r in pool.iterrows()}
     
     try:
-        for f in as_completed(futures, timeout=240): 
+        # 【终极算力解绑】：配合 GitHub Actions 的 30 分钟额度，将内部多线程强制熔断时间从 4 分钟放宽到 20 分钟（1200秒）
+        for f in as_completed(futures, timeout=1200): 
             row = futures[f]
             try:
                 hist = f.result()
@@ -785,6 +779,7 @@ def send_dingtalk(signals: list[Signal], watchlist: list, total_pool: int, total
             for s in display_signals:
                 warn_msg = "> ⚡ **【风险警示】** 该股为创业板(波动±20%)，心脏不好请务必**缩减仓位**！\n\n" if str(s.code).startswith('300') else ""
                 prefix = '1' if str(s.code).startswith('6') else '0'
+                tdx_market = 'SH' if str(s.code).startswith('6') else 'SZ' 
                 
                 sina_market = 'sh' if str(s.code).startswith('6') else 'sz'
                 kline_url = f"http://image.sinajs.cn/newchart/weekly/n/{sina_market}{s.code}.gif"

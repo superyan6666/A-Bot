@@ -15,10 +15,12 @@ import pandas as pd
 import pytz
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
 
-# ── 1. 环境与日志配置 ──────────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
+# 1. 环境与核心配置 (Environment & Config)
+# ═════════════════════════════════════════════════════════════════════════════
 TZ_BJS       = pytz.timezone('Asia/Shanghai')
 STATE_FILE   = 'pushed_state.json'
-SPOT_CACHE   = 'spot_cache.pkl'  # 【新增】全市场快照本地缓存文件
+SPOT_CACHE   = 'spot_cache.pkl'
 IS_MANUAL    = os.environ.get('GITHUB_EVENT_NAME') == 'workflow_dispatch'
 PUSH_EMPTY   = os.environ.get('PUSH_EMPTY_RESULT', 'true').lower() in ('true', '1', 'yes')
 
@@ -34,27 +36,56 @@ log = logging.getLogger(__name__)
 def _today_str() -> str:
     return datetime.now(TZ_BJS).strftime('%Y-%m-%d')
 
-def load_pushed_state() -> set:
-    today = _today_str()
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 2. 推送状态管理与 TTL 机制 (State Management)
+# ═════════════════════════════════════════════════════════════════════════════
+def load_pushed_state() -> dict:
+    """加载推送记录字典: {代码: 最后推送日期}"""
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE, 'r') as f:
-                state = json.load(f)
-            if state.get('date') == today:
-                return set(state.get('pushed_codes', []))
+                data = json.load(f)
+                # 向下兼容老版本(数组结构)与新版本(字典结构)
+                if 'date' in data and 'pushed_codes' in data:
+                    return {code: data['date'] for code in data.get('pushed_codes', [])}
+                return data
         except Exception as e:
             log.warning(f"读取推送记录失败: {e}")
-    return set()
+    return {}
 
-def save_pushed_state(codes: set) -> None:
+def save_pushed_state(pushed_dict: dict) -> None:
+    """保存推送记录，并自带 7 天过期垃圾回收 (GC) 机制防文件膨胀"""
+    today_dt = datetime.now(TZ_BJS).date()
+    clean_dict = {}
+    for code, date_str in pushed_dict.items():
+        try:
+            push_date = datetime.strptime(date_str, '%Y-%m-%d').date()
+            if (today_dt - push_date).days <= 7:
+                clean_dict[code] = date_str
+        except Exception:
+            pass
     try:
         with open(STATE_FILE, 'w') as f:
-            json.dump({'date': _today_str(), 'pushed_codes': list(codes)}, f)
+            json.dump(clean_dict, f)
     except Exception as e:
         log.error(f"保存推送记录失败: {e}")
 
+def is_recently_pushed(code: str, pushed: dict, cooldown_days: int = 3) -> bool:
+    """防刷屏机制：判断某只股票是否在指定的冷却期内已被推送过"""
+    if code not in pushed:
+        return False
+    try:
+        push_date = datetime.strptime(pushed[code], '%Y-%m-%d').date()
+        today_date = datetime.now(TZ_BJS).date()
+        return (today_date - push_date).days < cooldown_days
+    except Exception:
+        return False
 
-# ── 2. 数据契约与配置 (Schema & Config) ────────────────────────────────────────
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 3. 数据契约模型 (Data Schema & Models)
+# ═════════════════════════════════════════════════════════════════════════════
 @dataclass(frozen=True)
 class Cols:
     S_PRICE: str = '最新价'
@@ -80,8 +111,6 @@ class Cols:
     I_CLOSE: str = 'close'
     B_NAME: str  = '板块名称'
     B_PCT: str   = '涨跌幅'
-    INFO_ITEM: str = 'item'
-    INFO_VAL: str  = 'value'
 
 C = Cols()
 
@@ -99,7 +128,7 @@ class EnvParser:
 class Config:
     MIN_CAP: float       = field(default_factory=lambda: EnvParser.get_float('MIN_CAP', 30e8)) 
     MAX_CAP: float       = field(default_factory=lambda: EnvParser.get_float('MAX_CAP', 2000e8))
-    MAX_PRICE: float     = field(default_factory=lambda: EnvParser.get_float('MAX_PRICE', 500.0))  
+    MAX_PRICE: float     = field(default_factory=lambda: EnvParser.get_float('MAX_PRICE', 500.0))  # 兼容百元高价龙头
     MIN_PE: float        = field(default_factory=lambda: EnvParser.get_float('MIN_PE', 0))    
     MAX_PE: float        = field(default_factory=lambda: EnvParser.get_float('MAX_PE', 300))      
     MIN_TURNOVER: float  = field(default_factory=lambda: EnvParser.get_float('MIN_TURNOVER', 0.5))
@@ -112,7 +141,6 @@ class Config:
                             C.S_PCT, C.S_TURN, C.S_CODE, C.S_NAME, C.S_MCAP, C.S_PE, C.S_PB)
     OPTIONAL_COLS: tuple = (C.S_VR,)
     HIST_COLS: tuple     = (C.H_DATE, C.H_OPEN, C.H_CLOSE, C.H_HIGH, C.H_LOW, C.H_VOL)
-
 
 @dataclass
 class Signal:
@@ -134,8 +162,33 @@ class Signal:
     hold_period_msg: str = ""
 
 
-# ── 3. 小白防呆专享排版算法库 ──────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
+# 4. 专业量化算法核心库 (Quant Algorithms)
+# ═════════════════════════════════════════════════════════════════════════════
 class MathUtils:
+    @staticmethod
+    def calc_vcp_quality(df: pd.DataFrame) -> Tuple[float, bool]:
+        """
+        【结构测算】返回 (最近段振幅, 是否满足三阶段收敛)
+        VCP 标准：把最近30个交易日分成3段(10天/段)，每段的高低振幅必须依次缩小
+        """
+        if len(df) < 31:
+            return 0.5, False
+            
+        segments = []
+        for i in [(-31, -21), (-21, -11), (-11, -1)]:
+            seg = df.iloc[i[0]:i[1]]
+            low = seg[C.H_LOW].min()
+            if low > 0:
+                amp = (seg[C.H_HIGH].max() - low) / low
+                segments.append(amp)
+                
+        if len(segments) < 3:
+            return segments[-1] if segments else 0.5, False
+            
+        is_vcp = segments[0] > segments[1] > segments[2]
+        return segments[-1], is_vcp
+
     @staticmethod
     def calc_atr_adx(hist: pd.DataFrame, period: int = 14) -> Tuple[pd.Series, pd.Series]:
         high, low, close = hist[C.H_HIGH], hist[C.H_LOW], hist[C.H_CLOSE]
@@ -151,6 +204,7 @@ class MathUtils:
         return atr, dx.rolling(period).mean()
 
 def is_earnings_danger_zone(now: datetime) -> tuple[bool, str]:
+    """判断是否处于A股财报密集披露高危期"""
     month = now.month
     DANGER_WINDOWS = [
         (3, 25, 4, 30, "年报/一季报披露末期"),
@@ -164,6 +218,20 @@ def is_earnings_danger_zone(now: datetime) -> tuple[bool, str]:
             return True, label
     return False, ""
 
+def calc_target_price(price: float, stop: float, data: dict) -> float:
+    """【结构止盈】基于筹码密集区突破和前期高点，动态测算第一止盈目标"""
+    risk_amt = price - stop
+    if data.get('has_chip_break'):
+        max_1y = data.get('max_1y', price * 1.20)
+        chip_target = price + (max_1y - price) * 0.5
+        min_target = price + risk_amt * 1.5
+        return round(max(chip_target, min_target), 2)
+    return round(price + risk_amt * 2.0, 2)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 5. 排版与文案渲染器 (Markdown Renderers)
+# ═════════════════════════════════════════════════════════════════════════════
 def format_money_risk_msg(price: float, stop_loss: float, target1: float) -> str:
     one_hand_cost = price * 100
     budget_per_hand = 10000
@@ -232,7 +300,9 @@ def generate_hold_period(adx: float, price_pct: float, has_chip_break: bool) -> 
         return "- **⏳ 持股预期**：🐕 **【稳健震荡型】(2~4周)**，需要耐心等风来。"
 
 
-# ── 4. 数据拉取模块 ────────────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
+# 6. 数据拉取路由层 (Data Fetchers & Routers)
+# ═════════════════════════════════════════════════════════════════════════════
 import akshare as ak
 
 def retry(times=4, delay=2, exceptions=(Exception,)):
@@ -283,6 +353,38 @@ def fetch_core_pool() -> set:
     return pool
 
 @retry(times=3, delay=2)
+def fetch_hot_sectors() -> dict:
+    """
+    【自上而下主线过滤】返回 {股票代码: 板块名称}
+    提取今日涨幅排名前 5 的热门板块及其成分股，用于叠加行业轮动热度因子
+    """
+    hot_stocks = {}
+    try:
+        df = ak.stock_board_industry_name_em()
+        if df is None or df.empty: 
+            return {}
+        
+        top_sectors = df.nlargest(5, '涨跌幅')['板块名称'].tolist()
+        log.info(f"🌋 今日领涨主线板块抓取成功: {', '.join(top_sectors)}")
+        
+        for sector in top_sectors:
+            try:
+                time.sleep(0.5) 
+                cons = ak.stock_board_industry_cons_em(symbol=sector)
+                if cons is not None and not cons.empty:
+                    col = next((c for c in cons.columns if '代码' in c), None)
+                    if col:
+                        codes = cons[col].astype(str).str.zfill(6).tolist()
+                        for code in codes:
+                            hot_stocks[code] = sector
+            except Exception as e:
+                log.debug(f"获取板块【{sector}】成分股跳过: {e}")
+    except Exception as e:
+        log.warning(f"主线板块榜单数据获取失败: {e}")
+        
+    return hot_stocks
+
+@retry(times=3, delay=2)
 def fetch_hist(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
     try:
         df = ak.stock_zh_a_hist(symbol=code, period='daily', start_date=start, end_date=end, adjust='qfq')
@@ -300,12 +402,12 @@ def fetch_hist(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
         raise
     raise ValueError('history_empty')
 
-@retry(times=3, delay=5)  # 增加重试的间隔时间，给东财WAF喘息机会
+@retry(times=3, delay=5)  
 def fetch_spot() -> pd.DataFrame:
-    # 【新增功能：缓存机制防封锁】频繁测试时，如果在2小时内已有快照，直接读取本地缓存，不再请求东财服务器
+    """获取横截面数据（包含本地缓存兜底与防封锁抖动机制）"""
     if os.path.exists(SPOT_CACHE):
         mtime = os.path.getmtime(SPOT_CACHE)
-        if time.time() - mtime < 3600 * 2:  # 缓存有效期 2 小时
+        if time.time() - mtime < 3600 * 2:  
             try:
                 log.info("📦 检测到本地有效缓存，跳过全量接口请求，直接极速加载...")
                 return pd.read_pickle(SPOT_CACHE)
@@ -313,12 +415,11 @@ def fetch_spot() -> pd.DataFrame:
                 log.debug(f"缓存读取失败，将重新请求: {e}")
 
     try:
-        # 防护抖动：首次请求前随机暂停，防止 GitHub Action 的规律性发包被秒封
         time.sleep(random.uniform(1.0, 3.0))
         df = ak.stock_zh_a_spot_em()
         if df is not None and not df.empty:
             try:
-                df.to_pickle(SPOT_CACHE)  # 成功后写入缓存
+                df.to_pickle(SPOT_CACHE)  
             except Exception:
                 pass
             return df
@@ -345,8 +446,28 @@ def fetch_spot() -> pd.DataFrame:
         raise
     raise ValueError('spot_empty')
 
+@retry(times=2, delay=2)
+def fetch_northbound_flow() -> tuple[float, str]:
+    """返回 (当日北向净流入亿元, 信号描述)。正值=净买入，负值=净卖出"""
+    try:
+        df = ak.stock_em_hsgt_north_net_flow_in(indicator="沪深港通")
+        if df is not None and not df.empty:
+            col = 'value' if 'value' in df.columns else df.columns[-1]
+            today_flow = float(df.iloc[-1][col]) / 1e8
+            if today_flow > 30:
+                return today_flow, f"\n- 🌊 **聪明钱流向**：北水大举流入 **+{today_flow:.0f}亿**，外资看多做多"
+            elif today_flow < -30:
+                return today_flow, f"\n- ❄️ **聪明钱流向**：北水大幅流出 **{today_flow:.0f}亿**，外资谨慎避险"
+            else:
+                return today_flow, f"\n- ⚖️ **聪明钱流向**：北向资金温和 (**{today_flow:+.0f}亿**)"
+    except Exception as e:
+        log.debug(f"北向资金获取失败(可能受交易所限流): {e}")
+    return 0.0, ""
 
-# ── 5. A 股指标引擎 (Indicator Engine) ─────────────────────────────────────────
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 7. 技术面特征抽取引擎 (Feature Extraction Engine)
+# ═════════════════════════════════════════════════════════════════════════════
 class AShareTechnicals:
     def __init__(self, df: pd.DataFrame):
         self.df = df.copy()
@@ -401,8 +522,6 @@ class AShareTechnicals:
             else:
                 break
 
-        ma_convergence = (abs(today['MA10'] - today['MA20']) / today['MA20'] < 0.05) and \
-                         (abs(today['MA20'] - today['MA60']) / today['MA60'] < 0.08)
         extreme_shrink_vol = yest[C.H_VOL] < today['MA20_V'] * 0.75
 
         rec120 = df.iloc[-121:-1]
@@ -417,21 +536,30 @@ class AShareTechnicals:
             if df[C.H_CLOSE].iloc[-i] > df[C.H_OPEN].iloc[-i]: red_days += 1
             else: break
             
+        # 上影线防除零与真实长度比例测算
+        total_range = today[C.H_HIGH] - today[C.H_LOW]
+        upper_shadow = today[C.H_HIGH] - max(today[C.H_OPEN], today[C.H_CLOSE])
+        upper_shadow_pct = (upper_shadow / total_range * 100) if total_range > 1e-5 else 0.0
+
+        # 盘中前视偏差剔除，仅用昨日真实数据判断回踩
+        last_hist_pct = float(df['PCT_CHG'].iloc[-2]) if len(df) >= 2 else 0.0
         has_pullback = bool(
             today[C.H_CLOSE] >= today['MA20'] * 0.97 and 
             today[C.H_VOL] < today['MA5_V'] * 1.2 and
-            -6.0 <= df['PCT_CHG'].iloc[-1] <= 3.5
+            -6.0 <= last_hist_pct <= 3.5
         )
+        
+        vcp_amp, is_true_vcp = MathUtils.calc_vcp_quality(df)
 
         return {
             'price_pct': price_pct, 'max_1y': max_1y, 'adx': float(today['ADX']),
             'bull_rank': (today['MA20'] > today['MA60']),
-            'ma_convergence': ma_convergence,
             'extreme_shrink_vol': extreme_shrink_vol,
             'has_zt': bool((df['PCT_CHG'].iloc[-61:-1] >= 9.5).any()),
             'has_consecutive_zt': bool(((df['PCT_CHG'].iloc[-61:-1] >= 9.5).rolling(2).sum() >= 2).any()),
-            'vcp_amp': (df[C.H_HIGH].iloc[-11:-1].max() - df[C.H_LOW].iloc[-11:-1].min()) / df[C.H_LOW].iloc[-11:-1].min() if df[C.H_LOW].iloc[-11:-1].min() > 0 else 0.5,
-            'upper_shadow_pct': ((today[C.H_HIGH] - today[C.H_CLOSE]) / (today[C.H_CLOSE]-today[C.H_OPEN])*100) if (today[C.H_CLOSE]-today[C.H_OPEN]) > 0 else 0.0,
+            'vcp_amp': vcp_amp,
+            'is_true_vcp': is_true_vcp,
+            'upper_shadow_pct': upper_shadow_pct,
             'lower_shadow_ratio': (min(today[C.H_OPEN], today[C.H_CLOSE]) - today[C.H_LOW]) / today[C.H_OPEN] if pd.notna(today[C.H_OPEN]) and today[C.H_OPEN] > 0 else 0.0,
             'has_obv_break': bool(df['OBV'].iloc[-1] > df['OBV'].iloc[-21:-1].max()),
             'has_pullback': has_pullback,
@@ -442,13 +570,16 @@ class AShareTechnicals:
             'consecutive_down': consecutive_down,
             'macd_dea': float(today['DEA']),
             'ma10_val': float(today['MA10']), 'ma20_val': float(today['MA20']), 'atr_val': float(today['ATR']),
+            'close_val': float(today[C.H_CLOSE]),
             'low_val': float(today[C.H_LOW]), 'recent_20_low': float(df[C.H_LOW].iloc[-20:].min()),
             'boll_lower': float(today['MA20'] - 2 * df[C.H_CLOSE].iloc[-20:].dropna().std()) if len(df[C.H_CLOSE].iloc[-20:].dropna()) >= 2 else np.nan,
             'close_60d_ago': float(df[C.H_CLOSE].iloc[-60]) if len(df) >= 60 else 0.0,
         }
 
 
-# ── 6. 打分引擎 (Enhanced Scoring Engine) ───────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
+# 8. 打分与预筛分引擎 (Scoring & Prescreening Engine)
+# ═════════════════════════════════════════════════════════════════════════════
 @dataclass
 class Factor:
     condition: Callable[[dict], bool]
@@ -468,6 +599,8 @@ def apply_scoring(data: dict, now: datetime) -> tuple[int, str, str]:
         Factor(lambda d: d['vol_ratio'] > 1.0 and d['rs_rating'] > 5, 10, 1.0, "- 🚀 **强势领涨**：近期显著强于大盘，资金接力意愿极强"),
         Factor(lambda d: d['price_pct'] < 0.3 and 0 < d['pb'] < 1.0, 8, 1.0, "- ♻️ **困境反转**：股价严重破净且处于绝对低位，安全垫极厚"),
         
+        Factor(lambda d: d.get('in_hot_sector', False), 12, 1.0, "- 🌡️ **身处主线**：所在板块【{hot_sector_name}】今日强势领涨，踏准市场节奏"),
+        
         Factor(lambda d: d['price_pct'] < 0.25, 12, rw, "- 🟢 **绝对低位**：目前买入相当于抄底，长线持有安全"),
         Factor(lambda d: 0.25 <= d['price_pct'] <= 0.45, 8, 1.0, "- 🟢 **相对低位**：刚刚从底部爬起来，输时间不输钱"),
         Factor(lambda d: d['price_pct'] > 0.45, 6, 1.0, "- 📈 **多头趋势**：股价已脱离底部，处于健康的主升浪区间"),
@@ -483,14 +616,14 @@ def apply_scoring(data: dict, now: datetime) -> tuple[int, str, str]:
         Factor(lambda d: 30 <= d.get('rsi', 50) <= 72, 5, 1.0, "- 📊 **温度适中**：RSI处于健康买入区间，正是下手时机"),
         
         Factor(lambda d: d['bull_rank'], 8, 1.0, "- 📈 **顺势而为**：均线多头排列，跟着主力资金大部队走"),
-        Factor(lambda d: d['ma_convergence'], 10, 1.0, "- 🌪️ **面临变盘**：短期和长期成本几乎重合，随时向上爆发"), 
         
         Factor(lambda d: d['has_zt'], 8, 1.0, "- 🔥 **股性活跃**：该股历史上容易涨停，不会一潭死水"),
         Factor(lambda d: d['vol_ratio'] >= 1.8, 8, 1.0, "- 🔵 **放量确认**：今天成交量明显放大，大资金开始干活了"),
         Factor(lambda d: d['red_days'] >= 2, 5, 1.0, "- 🔴 **稳步推升**：最近重心都在上移，主力在偷偷温和建仓"),
         
         Factor(lambda d: d['has_chip_break'], 12, tw, "- 🏔️ **抛压真空**：上方的套牢盘已割肉离场，向上拉升没阻力"),
-        Factor(lambda d: d['vcp_amp'] < 0.12, 8, 1.0, "- 🟣 **蓄势待发**：近期波动极小，主力控盘很稳即将出方向"),
+        Factor(lambda d: d.get('is_true_vcp', False), 12, 1.0, "- 🎯 **形态确认**：呈现经典 VCP (波动率收敛) 结构，洗盘极度充分"),
+        Factor(lambda d: not d.get('is_true_vcp', False) and d['vcp_amp'] < 0.12, 6, 1.0, "- 🟣 **蓄势待发**：近期波动极小，面临短线方向选择"),
         Factor(lambda d: d['extreme_shrink_vol'], 8, 1.0, "- 🧊 **没人砸盘**：爆发前夕成交极度萎缩，散户该卖的都卖了"), 
         Factor(lambda d: d['has_obv_break'], 10, tw, "- 💸 **真金白银**：模型监控到真实的资金在创纪录净流入"),
         Factor(lambda d: d['has_pullback'], 12, 1.0, "- 🪃 **黄金深坑**：出现温和缩量回踩，主力洗盘给出的上车良机"),
@@ -504,7 +637,7 @@ def apply_scoring(data: dict, now: datetime) -> tuple[int, str, str]:
         Factor(lambda d: d.get('rs_rating', 0) < -10, -8, 1.0, "- 📉 **跑输大盘**：近期持续弱于大盘，跟的是被冷落的股票"),
         Factor(lambda d: d['has_consecutive_zt'] and d['price_pct'] < 0.40, 10, 1.0, "- 🔥 **低位连板**：刚刚启动的龙头，安全且市场辨识度极高"),
         Factor(lambda d: d['has_consecutive_zt'] and d['price_pct'] >= 0.90, -15, 1.0, "- ⚠️ **高位接盘**：股价已被炒高连板，千万别追容易接盘！"),
-        Factor(lambda d: d['upper_shadow_pct'] > 18, -15, 1.0, "- ⚠️ **诱多预警**：冲高后大幅跳水，上方抛压极重别上当！"),
+        Factor(lambda d: d['upper_shadow_pct'] > 35, -15, 1.0, "- ⚠️ **诱多预警**：冲高后大幅跳水，上方抛压极重别上当！"),
         Factor(lambda d: d['dist_ma20'] > 25, -15, 1.0, "- 🚫 **追高预警**：目前涨得太急离均线太远，随时面临暴跌回调"),
         
         Factor(lambda d: in_danger and d['mcap'] < 100e8, -8, 1.0, f"- 📅 **财报防雷**：当前属于{danger_label}，小盘股需防业绩变脸 (扣分)")
@@ -515,7 +648,10 @@ def apply_scoring(data: dict, now: datetime) -> tuple[int, str, str]:
     for f in factors:
         if f.condition(data):
             score += int(f.points * f.weight)
-            reasons.append(f.template.format(**data))
+            try:
+                reasons.append(f.template.format(**data))
+            except KeyError:
+                reasons.append(f.template)
 
     score = max(0, min(score, 100))
     
@@ -530,15 +666,45 @@ def apply_scoring(data: dict, now: datetime) -> tuple[int, str, str]:
         
     return score, level, '\n'.join(reasons)
 
+def prescreen_score(row: pd.Series) -> float:
+    """仅用 spot 数据打一个 0-100 的预筛分，无需历史数据，剔除明显无价值的标的"""
+    s = 50.0
+    vr = float(row.get(C.S_VR, 1.0))
+    pct = float(row.get(C.S_PCT, 0.0))
+    if vr > 1.5 and pct > 0:
+        s += 15
+    elif vr < 0.7:
+        s -= 10
+        
+    pe = float(row.get(C.S_PE, -1.0))
+    pb = float(row.get(C.S_PB, 99.0))
+    if 0 < pe < 40:
+        s += 8
+    if 0 < pb < 2:
+        s += 5
+        
+    mcap = float(row.get(C.S_MCAP, 0.0))
+    if 50e8 < mcap < 500e8:
+        s += 8
+        
+    if 1.0 < pct < 7.0:
+        s += 10
+    elif pct > 9.0:
+        s -= 15  
+        
+    return min(max(s, 0.0), 100.0)
 
-# ── 7. 信号流水线 (Signal Pipeline) ──────────────────────────────────────────
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 9. 核心流水线与主控 (Pipeline & Orchestrator)
+# ═════════════════════════════════════════════════════════════════════════════
 def is_valid_run_time(now: datetime) -> bool:
     if IS_MANUAL:
         return True
     t = now.hour * 100 + now.minute
     return t >= 1505
 
-def process_stock(row: pd.Series, raw_hist: pd.DataFrame, now: datetime, market_ok: bool, index_ret: float) -> Optional[tuple]:
+def process_stock(row: pd.Series, raw_hist: pd.DataFrame, now: datetime, market_ok: bool, index_ret: float, hot_sectors_map: dict) -> Optional[tuple]:
     if len(raw_hist) < 120: return None
     
     hist = raw_hist.copy()
@@ -563,21 +729,25 @@ def process_stock(row: pd.Series, raw_hist: pd.DataFrame, now: datetime, market_
     data['rs_rating'] = ((row[C.S_PRICE] / data['close_60d_ago'] - 1) * 100 - index_ret) if data['close_60d_ago'] > 0 else 0
     data['code'] = str(row[C.S_CODE])
     
-    supports = [data['ma10_val'], data['ma20_val'], data['recent_20_low'], data['boll_lower']]
-    valid_supports = [s for s in supports if pd.notna(s) and s < row[C.S_PRICE]]
+    data['in_hot_sector'] = data['code'] in hot_sectors_map
+    data['hot_sector_name'] = hot_sectors_map.get(data['code'], "热门")
     
-    stop = max(valid_supports + [row[C.S_PRICE] * 0.88]) * 0.993 
+    # 动态 ATR 防线：妖股给大空间，白马股给紧空间
+    atr_stop = data['close_val'] - 2.0 * data['atr_val']
+    stop = max(atr_stop, row[C.S_PRICE] * 0.88)
+    stop = round(stop, 2)
+    
     risk_pct = ((row[C.S_PRICE] - stop) / row[C.S_PRICE]) * 100 if row[C.S_PRICE] > 0 else 99
     
     if risk_pct > 25.0: return None 
 
     return (data, stop, risk_pct) 
 
-
-# ── 8. 控制器与大盘体检 (Orchestrator) ─────────────────────────────────────────
 def extract_market_context(df_raw: pd.DataFrame, c_conf: Config) -> tuple[pd.DataFrame, bool, str, float, bool]:
     market_ok, market_msg, index_ret, market_overheated = True, "", 0.0, False
     if len(df_raw) < 1000: return pd.DataFrame(), False, "API 异常，横截面数据不足", 0.0, False
+    
+    north_flow, north_msg = fetch_northbound_flow()
     
     try:
         df_raw[C.S_PE] = pd.to_numeric(df_raw[C.S_PE], errors='coerce')
@@ -587,11 +757,15 @@ def extract_market_context(df_raw: pd.DataFrame, c_conf: Config) -> tuple[pd.Dat
         cl = idx_df['close']
         ma20 = cl.rolling(20).mean().iloc[-1]
         pct = (cl.iloc[-1] - cl.iloc[-2]) / cl.iloc[-2] * 100
-        market_ok = (cl.iloc[-1] > ma20)
-        index_ret = ((cl.iloc[-1] / cl.iloc[-60]) - 1) * 100 if len(cl) >= 60 else 0.0
-
+        
+        market_trend_ok = cl.iloc[-1] > ma20
         up_count = (df_raw[C.S_PCT] > 0).sum()
         down_count = (df_raw[C.S_PCT] < 0).sum()
+        total_count = up_count + down_count
+        breadth = up_count / total_count if total_count > 0 else 0.5
+        vix_proxy = cl.pct_change().abs().tail(5).mean() * 100
+        index_ret = ((cl.iloc[-1] / cl.iloc[-60]) - 1) * 100 if len(cl) >= 60 else 0.0
+        
         zt_count = (df_raw[C.S_PCT] >= 9.0).sum() 
         dt_count = (df_raw[C.S_PCT] <= -9.0).sum() 
         total_amt = df_raw[C.S_AMT].sum() / 1e8 
@@ -600,32 +774,42 @@ def extract_market_context(df_raw: pd.DataFrame, c_conf: Config) -> tuple[pd.Dat
         if zt_count > 150:
             market_overheated = True
             sentiment_addon = "\n- 🚨 **情绪熔断**：今日涨停破百市场极度狂欢，系统禁止推荐个股防踩踏！"
-        elif dt_count > 100:
-            sentiment_addon = "\n- ❄️ **情绪冰点**：今日百股跌停恐慌出尽，往往是极佳防守反击点！"
 
-        breadth = up_count / (up_count + down_count) if (up_count + down_count) > 0 else 0.5
-        advice = ""
-        if market_overheated:
-            advice = "🛑 **强制空仓休息** (懂休息的才是真正的高手)"
-        elif market_ok and breadth >= 0.6:
-            advice = "🔥 **积极做多** (建议仓位 60%-80%，把握主线标的)"
-        elif market_ok and breadth < 0.6:
-            advice = "⚠️ **轻仓试错** (建议仓位 40%-60%，指数安全但个股分化)"
-        elif not market_ok and breadth <= 0.3:
-            advice = "🧊 **冰点防守** (建议仓位 10%-20%，系统性风险释放中)"
+        if breadth < 0.25 and vix_proxy > 1.5:
+            market_state = "🧊 **恐慌冰点 (PANIC)**"
+            advice = "仓位 10%-20%。系统性风险急剧释放，多看少动，仅适合轻仓左侧防守试错。"
+            market_ok = False
+        elif market_trend_ok and breadth > 0.6:
+            market_state = "🔥 **强势多头 (BULL)**"
+            advice = "仓位 60%-80%。赚钱效应极佳，资金活跃，跟随主线积极做多。"
+            market_ok = True
+        elif not market_trend_ok and breadth <= 0.4:
+            market_state = "🐻 **弱势空头 (BEAR)**"
+            advice = "仓位 20%-30%。均线压制且空头力量主导，控制手管住回撤。"
+            market_ok = False
         else:
-            advice = "🛡️ **弱势震荡** (建议仓位 20%-40%，控制手管住回撤)"
+            market_state = "⚖️ **震荡均衡 (NEUTRAL)**"
+            advice = "仓位 40%-60%。指数暂无大级别风险，重个股轻大盘，不盲目追高。"
+            market_ok = True
+
+        if north_flow <= -80.0:
+            market_ok = False
+            market_state += " ⚠️(外资砸盘)"
+            advice = "🚨 **外资大举出逃，强行压制做多情绪，建议立即防守并缩减仓位！** " + advice
+        elif north_flow >= 50.0 and not market_overheated:
+            market_ok = True
+            market_state += " 🚀(外资抢筹)"
 
         fallback_warning = ""
         if C.S_PE in df_raw.columns and (df_raw[C.S_PE] == -1.0).sum() > len(df_raw) * 0.9: 
-            fallback_warning = "\n\n> ⚠️ **数据源降级警报**\n> 频繁测试触发东方财富接口临时限制，已切至新浪备用源。基本面过滤(市盈率等)暂时失效，请自行排雷！"
+            fallback_warning = "\n\n> ⚠️ **数据源降级警报**\n> 频繁测试触发东方财富接口临时限制，已切至新浪备用源。基本面过滤(市盈率/量比等)暂时失效，请自行排雷！"
 
         market_msg = (
-            f"### 📊 大盘深度体检\n"
+            f"### 📊 大盘多维体检\n"
             f"- **上证指数**：`{cl.iloc[-1]:.2f}` (今日 **{pct:+.2f}%**)\n"
-            f"- **技术趋势**：{'🟢 企稳于 **MA20** 生命线' if market_ok else '🔴 跌破 **MA20** 生命线'}\n"
-            f"- **两市量能**：约 `{total_amt:.0f}` 亿元\n"
-            f"- **市场情绪**：红盘 `{up_count}` 家 / 绿盘 `{down_count}` 家 (涨停 `{zt_count}` / 跌停 `{dt_count}`){sentiment_addon}\n\n"
+            f"- **综合判定**：{market_state}\n"
+            f"- **市场广度**：红盘 `{up_count}` 家 / 绿盘 `{down_count}` 家 (涨停 `{zt_count}` / 跌停 `{dt_count}`)\n"
+            f"- **两市量能**：约 `{total_amt:.0f}` 亿元{sentiment_addon}{north_msg}\n\n"
             f"**💡 仓位建议**：{advice}{fallback_warning}"
         )
     except Exception as e:
@@ -659,6 +843,8 @@ def get_signals() -> tuple[list[Signal], list, set, int, str, int]:
         log.info("🤖 [大盘体检模式] 完毕，退出个股运算。")
         return [], [], pushed, 0, m_msg, len(df_raw)
 
+    hot_sectors_map = fetch_hot_sectors()
+
     if df_clean.empty:
         return [], [], pushed, 0, m_msg, 0
 
@@ -667,7 +853,8 @@ def get_signals() -> tuple[list[Signal], list, set, int, str, int]:
         df_clean = df_clean[df_clean[C.S_CODE].isin(core_pool)]
         log.info(f"💎 已开启【核心优质股池】模式，限定扫描 {len(core_pool)} 只国家队核心及高弹性成分股。")
 
-    pe_cond = (df_clean[C.S_PE] > c_conf.MIN_PE) | (df_clean[C.S_PE] == -1.0)
+    is_fallback = (df_clean[C.S_PE] == -1.0).sum() > len(df_clean) * 0.9
+    pe_cond = (df_clean[C.S_PE] > c_conf.MIN_PE) | is_fallback
     
     mask = (df_clean[C.S_PCT] >= c_conf.MIN_PCT_CHG) & \
            (df_clean[C.S_PRICE] <= c_conf.MAX_PRICE) & \
@@ -678,15 +865,19 @@ def get_signals() -> tuple[list[Signal], list, set, int, str, int]:
            (~df_clean[C.S_CODE].str.startswith(('688', '8', '4', '9'))) & \
            (df_clean[C.S_HIGH] > df_clean[C.S_LOW]) 
     
-    if C.S_VR in df_clean.columns:
+    if C.S_VR in df_clean.columns and not is_fallback:
         mask &= df_clean[C.S_VR].between(c_conf.MIN_VOL_RATIO, c_conf.MAX_VOL_RATIO)
 
-    pool = df_clean[mask].pipe(lambda d: d[~d[C.S_CODE].isin(pushed)]).copy()
+    recent_pushed_codes = {str(c) for c in df_clean[C.S_CODE] if is_recently_pushed(str(c), pushed, cooldown_days=3)}
+    pool = df_clean[mask].pipe(lambda d: d[~d[C.S_CODE].isin(recent_pushed_codes)]).copy()
+    
     if pool.empty: return [], [], pushed, len(df_clean), m_msg, len(df_clean)
     
     if len(pool) > 400:
-        log.info(f"💡 触发防爆流截断，优先保留最活跃(高换手)的 400 只核心标的参与决选。")
-        pool = pool.sort_values(by=C.S_TURN, ascending=False).head(400)
+        log.info(f"💡 触发防爆流截断，基于 Spot 截面数据执行廉价预筛分，保留前 400 只高潜标的参与决选。")
+        pool['_pre_score'] = pool.apply(prescreen_score, axis=1)
+        pool = pool.sort_values(by='_pre_score', ascending=False).head(400)
+        pool = pool.drop(columns=['_pre_score'])
 
     confirmed_data = [] 
     watchlist_data = [] 
@@ -701,14 +892,14 @@ def get_signals() -> tuple[list[Signal], list, set, int, str, int]:
             row = futures[f]
             try:
                 hist = f.result()
-                result = process_stock(row, hist, now, m_ok, idx_ret)
+                result = process_stock(row, hist, now, m_ok, idx_ret, hot_sectors_map)
                 if result:
                     data, stop, risk = result
                     
                     score, level, reas = apply_scoring(data, now)
                     
                     if score >= 70: 
-                        target1_price = round(row[C.S_PRICE]*(1+risk*2.5/100), 2)
+                        target1_price = calc_target_price(row[C.S_PRICE], stop, data)
                         
                         money_msg = format_money_risk_msg(row[C.S_PRICE], stop, target1_price)
                         tranche_msg = generate_tranche_plan(row[C.S_PRICE], score, m_ok, m_overheated)
@@ -724,7 +915,7 @@ def get_signals() -> tuple[list[Signal], list, set, int, str, int]:
                             money_risk_msg=money_msg, tranche_plan_msg=tranche_msg,
                             plan_b_msg=plan_b_msg, hold_period_msg=hold_msg
                         ))
-                        pushed.add(row[C.S_CODE]) 
+                        pushed[row[C.S_CODE]] = _today_str() 
                     elif score >= 60:  
                         watchlist_data.append((row[C.S_NAME], row[C.S_CODE], score, row[C.S_PRICE]))
                         
@@ -741,7 +932,9 @@ def get_signals() -> tuple[list[Signal], list, set, int, str, int]:
     return confirmed_data, watchlist_data, pushed, len(pool), m_msg, len(df_clean)
 
 
-# ── 9. 通知推送逻辑 ───────────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
+# 10. 钉钉网关与推送 (Webhook & Notification)
+# ═════════════════════════════════════════════════════════════════════════════
 def send_dingtalk(signals: list[Signal], watchlist: list, total_pool: int, total_market: int, market_msg: str) -> None:
     webhook = os.environ.get('DINGTALK_WEBHOOK')
     if not webhook:

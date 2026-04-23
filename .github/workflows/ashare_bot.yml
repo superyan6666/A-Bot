@@ -2,8 +2,8 @@ name: Intraday Right-Side Trading Bot
 
 on:
   schedule:
-    # 对应北京时间 15:30 触发 (周一至周五)，彻底转为盘后复盘策略
-    - cron: '30 7 * * 1-5'
+    # 提前至北京时间 14:45 触发 (尾盘买入法)，预留 Github Actions 队列排队延迟
+    - cron: '45 6 * * 1-5'
   workflow_dispatch:
     inputs:
       run_mode:
@@ -65,8 +65,7 @@ jobs:
         run: |
           if [ "$RUN_MODE" == "test_conn" ]; then
             echo "🔔 检测到测试模式，执行钉钉连通性推送..."
-            # 使用安全的 Here-Doc 语法，避免任何 Bash 的双引号解析冲突
-            python - << 'EOF'
+            python -c "
           import os, requests, datetime
           webhook = os.environ.get('DINGTALK_WEBHOOK')
           if not webhook:
@@ -76,7 +75,7 @@ jobs:
           msg = f'🤖 AI量化打板引擎 连通性测试成功！\n时间: {now}\n状态: GitHub Actions 触发器与网络链路完全畅通。'
           res = requests.post(webhook, json={'msgtype': 'text', 'text': {'content': msg}}, timeout=10)
           print('✅ 推送结果:', res.text)
-          EOF
+          "
           elif [ "$RUN_MODE" == "market_only" ]; then
             echo "📊 检测到大盘体检模式，开始扫描宏观资金与情绪指标..."
             python main.py
@@ -86,7 +85,7 @@ jobs:
           fi
 
       - name: 保存运行状态
-        if: ${{ github.event_name == 'schedule' || inputs.run_mode == 'normal' }}
+        if: ${{ github.event_name == 'schedule' || inputs.run_mode == 'normal' }} 
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
           commit_message: "[bot] 更新今日监控推送名单"

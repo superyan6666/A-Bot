@@ -42,13 +42,17 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: 缓存 pip 依赖
+      - name: 缓存 pip 依赖与行情数据
         uses: actions/cache@v4
         with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-quant-v2
+          # 【关键修复】：将历史K线目录和快照缓存一同纳入云端持久化，大幅提速并防封锁
+          path: |
+            ~/.cache/pip
+            hist_cache/
+            spot_cache.pkl
+          key: ${{ runner.os }}-quant-cache-${{ github.run_id }}
           restore-keys: |
-            ${{ runner.os }}-pip-quant-
+            ${{ runner.os }}-quant-cache-
 
       - name: 安装依赖
         run: |
@@ -65,7 +69,8 @@ jobs:
         run: |
           if [ "$RUN_MODE" == "test_conn" ]; then
             echo "🔔 检测到测试模式，执行钉钉连通性推送..."
-            python -c "
+            # 【逻辑梳理】：采用安全的 Here-Doc 语法，避免 Bash 单双引号转义冲突引发崩溃
+            python - << 'EOF'
           import os, requests, datetime
           webhook = os.environ.get('DINGTALK_WEBHOOK')
           if not webhook:
@@ -75,7 +80,7 @@ jobs:
           msg = f'🤖 AI量化打板引擎 连通性测试成功！\n时间: {now}\n状态: GitHub Actions 触发器与网络链路完全畅通。'
           res = requests.post(webhook, json={'msgtype': 'text', 'text': {'content': msg}}, timeout=10)
           print('✅ 推送结果:', res.text)
-          "
+          EOF
           elif [ "$RUN_MODE" == "market_only" ]; then
             echo "📊 检测到大盘体检模式，开始扫描宏观资金与情绪指标..."
             python main.py
@@ -84,10 +89,11 @@ jobs:
             python main.py
           fi
 
-      - name: 保存运行状态
+      - name: 保存运行状态与模拟盘账本
         if: ${{ github.event_name == 'schedule' || inputs.run_mode == 'normal' }} 
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          commit_message: "[bot] 更新今日监控推送名单"
-          file_pattern: 'pushed_state.json'
+          commit_message: "[bot] 更新推送状态与AI模拟盘账本"
+          # 【关键修复】：将新产生的 paper_trades.json 纳入自动提交，确保胜率能够跨日继承进化
+          file_pattern: 'pushed_state.json paper_trades.json'
           commit_options: '--no-verify --signoff'

@@ -14,15 +14,15 @@ log = logging.getLogger(__name__)
 def _today_str() -> str:
     return datetime.now(TZ_BJS).strftime('%Y-%m-%d')
 
-def format_dingtalk_pct(pct, is_us=False):
+def format_dingtalk_pct(pct, is_us=False, show_emoji=False):
     if pct > 0:
         color = "#2fc25b" if is_us else "#F04864"
-        emoji = "🟢" if is_us else "🔴"
-        return f'<font color="{color}">{emoji} +{pct:.2f}%</font>'
+        emoji = ("🟢 " if is_us else "🔴 ") if show_emoji else ""
+        return f'<font color="{color}">{emoji}+{pct:.2f}%</font>'
     elif pct < 0:
         color = "#F04864" if is_us else "#2fc25b"
-        emoji = "🔴" if is_us else "🟢"
-        return f'<font color="{color}">{emoji} {pct:.2f}%</font>'
+        emoji = ("🔴 " if is_us else "🟢 ") if show_emoji else ""
+        return f'<font color="{color}">{emoji}{pct:.2f}%</font>'
     else:
         return f'<font color="#8c8c8c"> 0.00%</font>'
 
@@ -95,7 +95,8 @@ class MacroJudgmentEngine:
             
             # 引入 ^SKEW (黑天鹅指数) 与 CL=F (原油)
             tickers = yf.Tickers("^TNX ^VIX ^SKEW HG=F GC=F CL=F ^GSPC 000300.SS")
-            hist = tickers.history(period="1mo")
+            # 使用 history 一次性拉取过去半年数据以计算 60 日均线
+            hist = tickers.history(period="6mo")
             close_df = hist['Close']
 
             def get_last(ticker):
@@ -106,6 +107,36 @@ class MacroJudgmentEngine:
                 s = close_df[ticker].dropna()
                 if len(s) > days: return s.iloc[-1] - s.iloc[-days-1]
                 return 0.0
+
+            def get_ma_trend(ticker):
+                s = close_df[ticker].dropna()
+                if len(s) < 60: return "数据不足", ""
+                
+                ma5 = s.rolling(5).mean().iloc[-1]
+                ma20 = s.rolling(20).mean().iloc[-1]
+                ma60 = s.rolling(60).mean().iloc[-1]
+                close = s.iloc[-1]
+                
+                mas = [ma5, ma20, ma60]
+                max_ma, min_ma = max(mas), min(mas)
+                spread = (max_ma - min_ma) / min_ma
+                
+                if spread < 0.02:
+                    return "均线粘连", "面临方向性变盘选择，资金观望情绪浓厚"
+                elif ma5 > ma20 > ma60:
+                    if close > ma5:
+                        return "三线开花(强势多头)", "全面多头排列，上行动能极强，顺势做多"
+                    else:
+                        return "多头排列(短期回踩)", "大趋势向上但短期回踩，关注下方均线支撑"
+                elif ma5 < ma20 < ma60:
+                    if close < ma5:
+                        return "空头瀑布(极度弱势)", "全面空头排列，下行趋势加速，严控仓位"
+                    else:
+                        return "空头排列(超跌反弹)", "大级别处于下降通道，当前属于超跌反弹"
+                elif ma60 > ma20 and ma5 > ma20:
+                    return "筑底反弹", "中长线偏空但短期均线拐头向上，左侧资金试盘"
+                else:
+                    return "震荡分化", "长短均线方向不一，无明显单边趋势"
 
             hg = get_last('HG=F')
             gc = get_last('GC=F')
@@ -160,16 +191,19 @@ class MacroJudgmentEngine:
             csi300_mtm = get_mtm('000300.SS')
             gspc_mtm = get_mtm('^GSPC')
 
+            csi300_trend_name, csi300_trend_desc = get_ma_trend('000300.SS')
+            gspc_trend_name, gspc_trend_desc = get_ma_trend('^GSPC')
+
             # 美股技术趋势
-            us_msg = f"> 📊 **技术趋势**: 标普500 5日动量(MTM) **{gspc_mtm:+.2f}** (RSI: {gspc_rsi:.1f})"
-            if gspc_rsi > 70: us_msg += "\n> 🔴 <font color=\"#2fc25b\">美股动能极度过热，随时面临技术性回调</font>"
-            elif gspc_rsi < 30: us_msg += "\n> 🟢 <font color=\"#F04864\">美股恐慌超卖，长线资金建仓点</font>"
+            us_msg = f"> 📊 **技术动能**: 标普500 5日MTM **{gspc_mtm:+.2f}** (RSI: {gspc_rsi:.1f})\n> 📈 **大盘趋势**: **{gspc_trend_name}** - {gspc_trend_desc}"
+            if gspc_rsi > 70: us_msg += "\n> 🔴 <font color=\"#2fc25b\">(美股动能极度过热，随时面临技术性回调)</font>"
+            elif gspc_rsi < 30: us_msg += "\n> 🟢 <font color=\"#F04864\">(美股恐慌超卖，长线资金建仓点)</font>"
             result["us_tech"] = us_msg
             
             # A股技术趋势
-            a_msg = f"> 📊 **技术趋势**: 沪深300 5日动量(MTM) **{csi300_mtm:+.2f}** (RSI: {csi300_rsi:.1f})"
-            if csi300_rsi < 30 and csi300_mtm > 0: a_msg += "\n> 🟢 <font color=\"#F04864\">A股严重超卖且动量拐头，具备左侧博弈价值</font>"
-            elif csi300_rsi > 70: a_msg += "\n> 🔴 <font color=\"#2fc25b\">A股逼近超买区，建议规避追涨</font>"
+            a_msg = f"> 📊 **技术动能**: 沪深300 5日MTM **{csi300_mtm:+.2f}** (RSI: {csi300_rsi:.1f})\n> 📈 **大盘趋势**: **{csi300_trend_name}** - {csi300_trend_desc}"
+            if csi300_rsi < 30 and csi300_mtm > 0: a_msg += "\n> 🟢 <font color=\"#F04864\">(A股严重超卖且动量拐头，具备左侧博弈价值)</font>"
+            elif csi300_rsi > 70: a_msg += "\n> 🔴 <font color=\"#2fc25b\">(A股逼近超买区，建议规避追涨)</font>"
             result["cn_tech"] = a_msg
 
         except ImportError:
@@ -292,11 +326,11 @@ class BriefingRenderer:
             if name == "恒生指数": continue # HSI belongs to China logically, but let's keep it here or separate?
             pct = data['pct']
             is_us = name in ["纳斯达克", "标普500", "道琼斯"]
-            global_strs.append(f"- **{name}**: {data['price']:.2f} {format_dingtalk_pct(pct, is_us)}")
+            global_strs.append(f"- **{name}**: {data['price']:.2f} {format_dingtalk_pct(pct, is_us, show_emoji=False)}")
             
         if "恒生指数" in global_idx:
             pct = global_idx["恒生指数"]['pct']
-            global_strs.append(f"- **恒生指数**: {global_idx['恒生指数']['price']:.2f} {format_dingtalk_pct(pct, False)}")
+            global_strs.append(f"- **恒生指数**: {global_idx['恒生指数']['price']:.2f} {format_dingtalk_pct(pct, False, show_emoji=False)}")
             
         if global_strs:
             lines.extend(global_strs)
@@ -312,7 +346,7 @@ class BriefingRenderer:
         for name, data in ashare_idx.items():
             pct = data.get('pct', 0.0)
             close_val = f"{data['close']:.2f} " if 'close' in data else ""
-            ashare_strs.append(f"- **{name}**: {close_val}{format_dingtalk_pct(pct)}")
+            ashare_strs.append(f"- **{name}**: {close_val}{format_dingtalk_pct(pct, show_emoji=False)}")
         if ashare_strs:
             lines.extend(ashare_strs)
         else:

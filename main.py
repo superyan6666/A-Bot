@@ -367,9 +367,19 @@ def generate_hold_period(adx: float, price_pct: float, has_chip_break: bool) -> 
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 6. 数据拉取路由层 (Data Fetchers & Routers)
+# 6. 统一数据代理与本地数据湖 (Data Proxy & Data Lake)
 # ═════════════════════════════════════════════════════════════════════════════
 import akshare as ak
+
+try:
+    import baostock as bs
+except ImportError:
+    bs = None
+
+try:
+    import efinance as ef
+except ImportError:
+    ef = None
 
 def retry(times=4, delay=2, exceptions=(Exception,)):
     def decorator(fn):
@@ -387,157 +397,234 @@ def retry(times=4, delay=2, exceptions=(Exception,)):
         return wrapper
     return decorator
 
-@retry(times=4, delay=2)
-def fetch_index(symbol: str) -> pd.DataFrame:
-    try:
-        df = ak.stock_zh_index_daily_tx(symbol=symbol)
+class DataProxy:
+    """数据获取多源路由层 (Fallback Waterfall)"""
+    def __init__(self):
+        self.bs_logged_in = False
+
+    def __del__(self):
+        if self.bs_logged_in and bs is not None:
+            try: bs.logout()
+            except: pass
+
+    def _login_baostock(self):
+        if bs is not None and not self.bs_logged_in:
+            bs.login()
+            self.bs_logged_in = True
+
+    # ---- [1. Historical Data] ----
+    def _fetch_hist_tushare(self, code, start, end):
+        # TODO: 预留给 Tushare / QMT 实盘高级接口 (最高优)
+        return None
+
+    def _fetch_hist_baostock(self, code, start, end):
+        if bs is None: return None
+        self._login_baostock()
+        try:
+            prefix = 'sh.' if code.startswith('6') else 'sz.'
+            # baostock 的日期格式要求 YYYY-MM-DD
+            start_fmt = f"{start[:4]}-{start[4:6]}-{start[6:]}"
+            end_fmt = f"{end[:4]}-{end[4:6]}-{end[6:]}"
+            rs = bs.query_history_k_data_plus(prefix + code,
+                "date,open,close,high,low,volume",
+                start_date=start_fmt, end_date=end_fmt,
+                frequency="d", adjustflag="1") # 1 = 前复权
+            
+            data_list = []
+            while (rs.error_code == '0') & rs.next():
+                data_list.append(rs.get_row_data())
+            if not data_list: return None
+            
+            df = pd.DataFrame(data_list, columns=rs.fields)
+            df = df.rename(columns={'date': C.H_DATE, 'open': C.H_OPEN, 'close': C.H_CLOSE, 'high': C.H_HIGH, 'low': C.H_LOW, 'volume': C.H_VOL})
+            for col in [C.H_OPEN, C.H_CLOSE, C.H_HIGH, C.H_LOW, C.H_VOL]:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+            return df[list(Config.HIST_COLS)]
+        except Exception as e:
+            log.debug(f"[Tier 2 BaoStock] 获取历史失败: {e}")
+            return None
+
+    @retry(times=3, delay=2)
+    def _fetch_hist_akshare(self, code, start, end):
+        try:
+            df = ak.stock_zh_a_hist(symbol=code, period='daily', start_date=start, end_date=end, adjust='qfq')
+            if df is not None and not df.empty:
+                return df[list(Config.HIST_COLS)].copy()
+        except Exception as e:
+            try:
+                df = ak.stock_zh_a_hist_tx(symbol=code, start_date=start, end_date=end, adjust='qfq')
+                if df is not None and not df.empty:
+                    col_map = {'日期': C.H_DATE, '开盘': C.H_OPEN, '收盘': C.H_CLOSE, '最高': C.H_HIGH, '最低': C.H_LOW, '成交量': C.H_VOL}
+                    df = df.rename(columns=col_map)
+                    return df[list(Config.HIST_COLS)].copy()
+            except Exception:
+                pass
+            raise ValueError(f'akshare history empty for {code}')
+            
+    def get_hist(self, code, start, end) -> pd.DataFrame:
+        df = self._fetch_hist_tushare(code, start, end)
+        if df is not None: return df
+        df = self._fetch_hist_baostock(code, start, end)
+        if df is not None: return df
+        return self._fetch_hist_akshare(code, start, end)
+
+    # ---- [2. Spot Data (实时横截面)] ----
+    def _fetch_spot_qmt(self):
+        # TODO: 预留给 QMT / Tushare (最高优)
+        return None
+
+    def _fetch_spot_efinance(self):
+        if ef is None: return None
+        try:
+            df = ef.stock.get_realtime_quotes()
+            if df is not None and not df.empty:
+                rename_map = {'代码': C.S_CODE, '名称': C.S_NAME, '最新价': C.S_PRICE,
+                              '涨跌幅': C.S_PCT, '今开': C.S_OPEN, '最高': C.S_HIGH,
+                              '最低': C.S_LOW, '成交量': C.S_VOL, '成交额': C.S_AMT,
+                              '换手率': C.S_TURN, '市盈率-动态': C.S_PE, '市净率': C.S_PB, '量比': C.S_VR}
+                df = df.rename(columns=rename_map)
+                return df
+        except Exception as e:
+            log.debug(f"[Tier 2 efinance] 获取实时行情失败: {e}")
+        return None
+
+    @retry(times=3, delay=5)
+    def _fetch_spot_akshare(self):
+        try:
+            time.sleep(random.uniform(1.0, 3.0))
+            df = ak.stock_zh_a_spot_em()
+            if df is not None and not df.empty:
+                return df
+        except Exception as e:
+            log.warning(f"行情主接口异常: {e}，正在启动新浪备用源执行优雅降级...")
+            df = ak.stock_zh_a_spot()
+            if df is not None and not df.empty:
+                rename_map = {'代码': C.S_CODE, '名称': C.S_NAME, '最新价': C.S_PRICE,
+                              '涨跌幅': C.S_PCT, '今开': C.S_OPEN, '最高': C.S_HIGH,
+                              '最低': C.S_LOW, '成交量': C.S_VOL, '成交额': C.S_AMT}
+                df = df.rename(columns=rename_map)
+                fallback_defaults = {C.S_TURN: 2.0, C.S_MCAP: 100e8, C.S_PE: -1.0, C.S_PB: 2.0, C.S_VR: 1.0}
+                for col, val in fallback_defaults.items():
+                    if col not in df.columns: df[col] = val
+                return df
+            raise ValueError('spot_empty')
+            
+    def get_spot(self) -> pd.DataFrame:
+        df = self._fetch_spot_qmt()
+        if df is not None: return df
+        df = self._fetch_spot_efinance()
+        if df is not None: return df
+        return self._fetch_spot_akshare()
+
+    # ---- [3. Index & Context] ----
+    @retry(times=4, delay=2)
+    def get_index(self, symbol: str) -> pd.DataFrame:
+        try:
+            df = ak.stock_zh_index_daily_tx(symbol=symbol)
+            if df is not None and not df.empty:
+                df.columns = [c.lower() for c in df.columns]
+                return df
+        except Exception as e:
+            log.warning(f"腾讯指数接口波动 ({symbol}): {e}，切换东方财富源...")
+        
+        df = ak.stock_zh_index_daily_em(symbol=symbol)
         if df is not None and not df.empty:
             df.columns = [c.lower() for c in df.columns]
             return df
-    except Exception as e:
-        log.warning(f"腾讯指数接口波动 ({symbol}): {e}，切换东方财富源...")
-    
-    df = ak.stock_zh_index_daily_em(symbol=symbol)
-    if df is not None and not df.empty:
-        df.columns = [c.lower() for c in df.columns]
-        return df
-    raise ValueError(f'index_empty_{symbol}')
+        raise ValueError(f'index_empty_{symbol}')
 
-@retry(times=3, delay=2)
-def fetch_core_pool() -> set:
-    pool = set()
-    try:
-        for idx in ["000300", "000905", "000852", "399006"]:
-            df = ak.index_stock_cons(symbol=idx)
-            if df is not None and not df.empty:
-                col = next((c for c in df.columns if '代码' in c), None)
-                if col:
-                    pool.update(df[col].astype(str).str.zfill(6).tolist())
-    except Exception as e:
-        log.warning(f"获取核心成分股池失败，将降级为全市场扫描: {e}")
-    return pool
-
-@retry(times=3, delay=2)
-def fetch_hot_sectors() -> dict:
-    hot_stocks = {}
-    try:
-        df = ak.stock_board_industry_name_em()
-        if df is None or df.empty: 
-            return {}
-        
-        top_sectors = df.nlargest(5, '涨跌幅')['板块名称'].tolist()
-        log.info(f"🌋 今日领涨主线板块抓取成功: {', '.join(top_sectors)}")
-        
-        for sector in top_sectors:
-            try:
-                time.sleep(0.5) 
-                cons = ak.stock_board_industry_cons_em(symbol=sector)
-                if cons is not None and not cons.empty:
-                    col = next((c for c in cons.columns if '代码' in c), None)
-                    if col:
-                        codes = cons[col].astype(str).str.zfill(6).tolist()
-                        for code in codes:
-                            hot_stocks[code] = sector
-            except Exception as e:
-                log.debug(f"获取板块【{sector}】成分股跳过: {e}")
-    except Exception as e:
-        log.warning(f"主线板块榜单数据获取失败: {e}")
-    return hot_stocks
-
-@retry(times=3, delay=2)
-def fetch_hist(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
-    cache_file = os.path.join(HIST_CACHE_DIR, f"{code}_{end}.pkl")
-    if os.path.exists(cache_file):
+    @retry(times=3, delay=2)
+    def get_core_pool(self) -> set:
+        pool = set()
         try:
-            return pd.read_pickle(cache_file)
-        except Exception:
-            pass
+            for idx in ["000300", "000905", "000852", "399006"]:
+                df = ak.index_stock_cons(symbol=idx)
+                if df is not None and not df.empty:
+                    col = next((c for c in df.columns if '代码' in c), None)
+                    if col: pool.update(df[col].astype(str).str.zfill(6).tolist())
+        except Exception as e:
+            log.warning(f"获取核心成分股池失败，降级为全市场扫描: {e}")
+        return pool
 
-    try:
-        df = ak.stock_zh_a_hist(symbol=code, period='daily', start_date=start, end_date=end, adjust='qfq')
-        if df is not None and not df.empty:
-            df_to_save = df[list(Config.HIST_COLS)].copy()
-            try:
-                df_to_save.to_pickle(cache_file) 
-            except Exception:
-                pass
-            return df_to_save
-    except Exception as e:
+    @retry(times=3, delay=2)
+    def get_hot_sectors(self) -> dict:
+        hot_stocks = {}
         try:
-            df = ak.stock_zh_a_hist_tx(symbol=code, start_date=start, end_date=end, adjust='qfq')
-            if df is not None and not df.empty:
-                col_map = {'日期': C.H_DATE, '开盘': C.H_OPEN, '收盘': C.H_CLOSE, '最高': C.H_HIGH, '最低': C.H_LOW, '成交量': C.H_VOL}
-                df = df.rename(columns=col_map)
-                df_to_save = df[list(Config.HIST_COLS)].copy()
+            df = ak.stock_board_industry_name_em()
+            if df is None or df.empty: return {}
+            top_sectors = df.nlargest(5, '涨跌幅')['板块名称'].tolist()
+            for sector in top_sectors:
                 try:
-                    df_to_save.to_pickle(cache_file)
-                except Exception:
-                    pass
-                return df_to_save
-        except Exception:
-            pass
-        raise
-    raise ValueError('history_empty')
+                    time.sleep(0.5) 
+                    cons = ak.stock_board_industry_cons_em(symbol=sector)
+                    if cons is not None and not cons.empty:
+                        col = next((c for c in cons.columns if '代码' in c), None)
+                        if col:
+                            for code in cons[col].astype(str).str.zfill(6).tolist():
+                                hot_stocks[code] = sector
+                except Exception: pass
+        except Exception as e:
+            log.warning(f"主线板块榜单数据获取失败: {e}")
+        return hot_stocks
 
-@retry(times=3, delay=5)  
-def fetch_spot() -> pd.DataFrame:
-    if os.path.exists(SPOT_CACHE):
-        mtime = os.path.getmtime(SPOT_CACHE)
-        if time.time() - mtime < 3600 * 2:  
-            try:
+    @retry(times=2, delay=2)
+    def get_northbound_flow(self) -> tuple[float, str]:
+        try:
+            df = ak.stock_em_hsgt_north_net_flow_in(indicator="沪深港通")
+            if df is not None and not df.empty:
+                col = 'value' if 'value' in df.columns else df.columns[-1]
+                today_flow = float(df.iloc[-1][col]) / 1e8
+                if today_flow > 30: return today_flow, f"\n- 🌊 **聪明钱流向**：北水大举流入 **+{today_flow:.0f}亿**"
+                elif today_flow < -30: return today_flow, f"\n- ❄️ **聪明钱流向**：北水大幅流出 **{today_flow:.0f}亿**"
+                else: return today_flow, f"\n- ⚖️ **聪明钱流向**：北向资金温和 (**{today_flow:+.0f}亿**)"
+        except Exception: pass
+        return 0.0, ""
+
+class LocalDataLake:
+    """本地数据湖缓存拦截层"""
+    def __init__(self, proxy: DataProxy):
+        self.proxy = proxy
+        self.spot_cache = SPOT_CACHE
+        self.hist_dir = HIST_CACHE_DIR
+
+    def fetch_spot(self) -> pd.DataFrame:
+        if os.path.exists(self.spot_cache):
+            mtime = os.path.getmtime(self.spot_cache)
+            if time.time() - mtime < 3600 * 2:  
                 log.info("📦 检测到本地有效缓存，跳过全量接口请求，直接极速加载...")
-                return pd.read_pickle(SPOT_CACHE)
-            except Exception as e:
-                log.debug(f"缓存读取失败，将重新请求: {e}")
+                try: return pd.read_pickle(self.spot_cache)
+                except Exception: pass
+        df = self.proxy.get_spot()
+        try: df.to_pickle(self.spot_cache)
+        except Exception: pass
+        return df
 
-    try:
-        time.sleep(random.uniform(1.0, 3.0))
-        df = ak.stock_zh_a_spot_em()
-        if df is not None and not df.empty:
-            try:
-                df.to_pickle(SPOT_CACHE)  
-            except Exception:
-                pass
-            return df
-    except Exception as e:
-        log.warning(f"行情主接口严重异常: {e}，频繁测试可能触发了东方财富的临时IP封禁限制。")
-        log.warning("正在启动新浪备用源并执行优雅降级...")
-        df = ak.stock_zh_a_spot()
-        if df is not None and not df.empty:
-            rename_map = {'代码': C.S_CODE, '名称': C.S_NAME, '最新价': C.S_PRICE,
-                          '涨跌幅': C.S_PCT, '今开': C.S_OPEN, '最高': C.S_HIGH,
-                          '最低': C.S_LOW, '成交量': C.S_VOL, '成交额': C.S_AMT}
-            df = df.rename(columns=rename_map)
-            fallback_defaults = {
-                C.S_TURN: 2.0,      
-                C.S_MCAP: 100e8,    
-                C.S_PE: -1.0,       
-                C.S_PB: 2.0,        
-                C.S_VR: 1.0         
-            }
-            for col, val in fallback_defaults.items():
-                if col not in df.columns:
-                    df[col] = val
-            return df
-        raise
-    raise ValueError('spot_empty')
+    def fetch_hist(self, code: str, start: str, end: str) -> Optional[pd.DataFrame]:
+        cache_file = os.path.join(self.hist_dir, f"{code}_{end}.pkl")
+        if os.path.exists(cache_file):
+            try: return pd.read_pickle(cache_file)
+            except Exception: pass
+        df = self.proxy.get_hist(code, start, end)
+        if df is not None:
+            try: df.to_pickle(cache_file)
+            except Exception: pass
+        return df
 
-@retry(times=2, delay=2)
-def fetch_northbound_flow() -> tuple[float, str]:
-    try:
-        df = ak.stock_em_hsgt_north_net_flow_in(indicator="沪深港通")
-        if df is not None and not df.empty:
-            col = 'value' if 'value' in df.columns else df.columns[-1]
-            today_flow = float(df.iloc[-1][col]) / 1e8
-            if today_flow > 30:
-                return today_flow, f"\n- 🌊 **聪明钱流向**：北水大举流入 **+{today_flow:.0f}亿**，外资看多做多"
-            elif today_flow < -30:
-                return today_flow, f"\n- ❄️ **聪明钱流向**：北水大幅流出 **{today_flow:.0f}亿**，外资谨慎避险"
-            else:
-                return today_flow, f"\n- ⚖️ **聪明钱流向**：北向资金温和 (**{today_flow:+.0f}亿**)"
-    except Exception as e:
-        log.debug(f"北向资金获取失败(可能受交易所限流): {e}")
-    return 0.0, ""
+    def fetch_index(self, symbol: str): return self.proxy.get_index(symbol)
+    def fetch_core_pool(self): return self.proxy.get_core_pool()
+    def fetch_hot_sectors(self): return self.proxy.get_hot_sectors()
+    def fetch_northbound_flow(self): return self.proxy.get_northbound_flow()
+
+# ── 实例化全局单例，保持对外接口完全兼容 ──
+_DATA_PROXY = DataProxy()
+_DATA_LAKE = LocalDataLake(_DATA_PROXY)
+
+def fetch_spot(): return _DATA_LAKE.fetch_spot()
+def fetch_hist(code, start, end): return _DATA_LAKE.fetch_hist(code, start, end)
+def fetch_index(symbol): return _DATA_LAKE.fetch_index(symbol)
+def fetch_core_pool(): return _DATA_LAKE.fetch_core_pool()
+def fetch_hot_sectors(): return _DATA_LAKE.fetch_hot_sectors()
+def fetch_northbound_flow(): return _DATA_LAKE.fetch_northbound_flow()
 
 
 # ═════════════════════════════════════════════════════════════════════════════

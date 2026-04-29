@@ -14,6 +14,18 @@ log = logging.getLogger(__name__)
 def _today_str() -> str:
     return datetime.now(TZ_BJS).strftime('%Y-%m-%d')
 
+def format_dingtalk_pct(pct, is_us=False):
+    if pct > 0:
+        color = "#2fc25b" if is_us else "#F04864"
+        emoji = "🟢" if is_us else "🔴"
+        return f'<font color="{color}">{emoji} +{pct:.2f}%</font>'
+    elif pct < 0:
+        color = "#F04864" if is_us else "#2fc25b"
+        emoji = "🔴" if is_us else "🟢"
+        return f'<font color="{color}">{emoji} {pct:.2f}%</font>'
+    else:
+        return f'<font color="#8c8c8c"> 0.00%</font>'
+
 class MacroBrain:
     @staticmethod
     def get_ashare_indices():
@@ -105,7 +117,7 @@ class HotStockRadar:
                 sectors = [s for s in sectors if s[1] > 0.5]
                 top_sectors = []
                 for s in sectors[:limit]:
-                    top_sectors.append(f"{s[0]} ({s[1]:+.2f}%) ➜ 👑 龙头: **{s[2]}** ({s[3]:+.2f}%)")
+                    top_sectors.append(f"**{s[0]}** {format_dingtalk_pct(s[1])} ➜ 👑 龙头: **{s[2]}** {format_dingtalk_pct(s[3])}")
                 return top_sectors
 
         except Exception as e:
@@ -130,7 +142,7 @@ class NewsDigest:
                         title = row['title'] if row['title'] else row['content'][:50]+"..."
                         # 过滤无意义简报
                         if len(title) > 8 and "盘前必读" not in title and "早报" not in title:
-                            news_list.append(f"【{time_str}】{title}")
+                            news_list.append(f"> **[{time_str}]** {title}")
                         if len(news_list) >= limit: break
                     if news_list:
                         log.info("机构级财联社新闻获取成功")
@@ -151,7 +163,7 @@ class NewsDigest:
                 title = doc.get('title', '')
                 if any(k in title for k in keywords) or len(title) > 20:
                     dt = datetime.fromtimestamp(int(doc['ctime']))
-                    news_list.append(f"【{dt.strftime('%H:%M')}】{title}")
+                    news_list.append(f"> **[{dt.strftime('%H:%M')}]** {title}")
                 if len(news_list) >= limit: break
                 
         except Exception as e:
@@ -177,54 +189,51 @@ class BriefingRenderer:
         
         # 渲染 Markdown
         lines = []
-        lines.append(f"📊 **AI 每日市场简报 · {date_str}**\n")
+        lines.append(f"## 🤖 AI 每日市场简报\n*{date_str}*\n")
         
         # --- 全球宏观 ---
-        lines.append("━━━ 🌍 **全球宏观雷达** ━━━")
+        lines.append("---\n### 🌍 全球宏观雷达")
         global_strs = []
         for name, data in global_idx.items():
             pct = data['pct']
-            sign = "🔴 " if pct > 0 else ("🟢 " if pct < 0 else "")
-            global_strs.append(f"{name}: {data['price']:.2f} ({sign}{pct:+.2f}%)")
+            is_us = name in ["纳斯达克", "标普500", "道琼斯"]
+            global_strs.append(f"- **{name}**: {data['price']:.2f} {format_dingtalk_pct(pct, is_us)}")
         if global_strs:
-            lines.append(" • " + "\n • ".join(global_strs))
+            lines.extend(global_strs)
         else:
-            lines.append("- 暂无全球指数实时数据")
+            lines.append("- <font color=\"#8c8c8c\">暂无实时数据</font>")
             
         # --- A股大盘 ---
-        lines.append("\n━━━ 🇨🇳 **A股大盘体检** ━━━")
+        lines.append("\n### 🇨🇳 A股大盘体检")
         ashare_strs = []
         for name, data in ashare_idx.items():
             pct = data.get('pct', 0.0)
-            sign = "🔴 " if pct > 0 else ("🟢 " if pct < 0 else "")
-            # 若含有 close 可以加上
             close_val = f"{data['close']:.2f} " if 'close' in data else ""
-            ashare_strs.append(f"{name}: {close_val}({sign}{pct:+.2f}%)")
+            ashare_strs.append(f"- **{name}**: {close_val}{format_dingtalk_pct(pct)}")
         if ashare_strs:
-            lines.append(" • " + "\n • ".join(ashare_strs))
+            lines.extend(ashare_strs)
         else:
-            lines.append("- 暂无A股指数数据")
+            lines.append("- <font color=\"#8c8c8c\">暂无实时数据</font>")
             
         if flow_msg:
-            lines.append(flow_msg.strip())
+            lines.append(f"\n{flow_msg.strip()}")
             
         # --- 热门赛道 ---
-        lines.append("\n━━━ 🔥 **今日热门主线** ━━━")
+        lines.append("\n### 🔥 今日资金主线")
         if top_sectors:
             for i, sector in enumerate(top_sectors, 1):
                 lines.append(f"{i}. {sector}")
         else:
-            lines.append("- 市场情绪低迷，未识别到明显主线")
+            lines.append("> <font color=\"#8c8c8c\">市场情绪低迷，未识别到明显主线</font>")
             
         # --- 市场热点 ---
-        lines.append("\n━━━ 📰 **市场热点追踪** ━━━")
+        lines.append("\n### 📰 核心投研资讯")
         if news:
-            for i, n in enumerate(news, 1):
-                lines.append(f"{i}. {n}")
+            lines.extend(news)
         else:
-            lines.append("- 暂无重大新闻")
+            lines.append("> <font color=\"#8c8c8c\">暂无重大新闻</font>")
             
-        lines.append("\n---\n*🤖 由 Antigravity 量化引擎自动生成*")
+        lines.append("\n---\n*<font color=\"#8c8c8c\">Antigravity 机构级量化引擎自动生成</font>*")
         return "\n".join(lines)
 
 def send_dingtalk(content: str):

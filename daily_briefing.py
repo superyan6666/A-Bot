@@ -45,12 +45,9 @@ class MacroBrain:
     def get_global_indices():
         indices_data = {}
         try:
-            # int_dji (道琼斯), int_nasdaq (纳斯达克), int_sp500 (标普), b_HSI (恒指)
             url = "https://hq.sinajs.cn/list=int_dji,int_nasdaq,int_sp500,b_HSI"
             headers = {"Referer": "https://finance.sina.com.cn/"}
             res = requests.get(url, headers=headers, timeout=5)
-            # 返回格式: var hq_str_int_nasdaq="纳斯达克,15927.90,1.23,1.5, ..."; 
-            # 港股格式可能不同，按逗号分隔，第4个通常是涨跌幅或第3个。
             for line in res.text.strip().split('\n'):
                 if '="' in line:
                     key = line.split('=')[0]
@@ -58,13 +55,11 @@ class MacroBrain:
                     
                     if "int_" in key and len(parts) >= 4:
                         name = parts[0]
+                        price = float(parts[1])
                         pct = float(parts[3])
-                        indices_data[name] = {"pct": pct}
+                        indices_data[name] = {"pct": pct, "price": price}
                     elif "b_HSI" in key and len(parts) >= 6:
-                        # 恒指: "恒生指数,16000.00,15000.00,16500.00,16200.00,200.00,1.25"
-                        # 通常第6或第7是涨跌幅
-                        indices_data["恒生指数"] = {"pct": float(parts[6])}
-            log.info(f"新浪外盘获取成功: {indices_data}")
+                        indices_data["恒生指数"] = {"pct": float(parts[6]), "price": float(parts[1])}
         except Exception as e:
             log.warning(f"新浪外盘数据失败: {e}")
             
@@ -89,7 +84,6 @@ class HotStockRadar:
                 headers = {"Referer": "https://finance.sina.com.cn/"}
                 res = requests.get(url, headers=headers, timeout=5)
                 res.encoding = 'gbk'
-                # var S_KV = {"new_bljc":"new_bljc,玻璃建材,55,13.23,2.45, ..."}
                 text = res.text.split("=")[1].strip().strip(";")
                 import json
                 data = json.loads(text)
@@ -97,16 +91,21 @@ class HotStockRadar:
                 sectors = []
                 for k, v in data.items():
                     parts = v.split(',')
-                    if len(parts) >= 6:
+                    if len(parts) >= 13:
                         name = parts[1]
                         try:
                             pct = float(parts[5])
-                            sectors.append((name, pct))
+                            ldr_name = parts[12]
+                            ldr_pct = float(parts[11])
+                            sectors.append((name, pct, ldr_name, ldr_pct))
                         except: pass
                 
                 sectors.sort(key=lambda x: x[1], reverse=True)
-                top_sectors = [s[0] for s in sectors[:limit]]
-                log.info(f"新浪兜底板块提取成功: {top_sectors}")
+                # 过滤涨幅极小的无意义板块
+                sectors = [s for s in sectors if s[1] > 0.5]
+                top_sectors = []
+                for s in sectors[:limit]:
+                    top_sectors.append(f"{s[0]} ({s[1]:+.2f}%) ➜ 👑 龙头: **{s[2]}** ({s[3]:+.2f}%)")
                 return top_sectors
 
         except Exception as e:
@@ -116,28 +115,47 @@ class HotStockRadar:
 class NewsDigest:
     @staticmethod
     def get_news(limit=5):
-        log.info("尝试拉取新浪 7x24 财经滚播新闻...")
         news_list = []
+        
+        # 1. 首选: Tushare 机构级财联社电报 (过滤水文)
         try:
-            # lid=2509 表示A股/财经相关滚播
-            url = "https://feed.mix.sina.com.cn/api/roll/get?pageid=153&lid=2509&k=&num=10&page=1"
-            headers = {"Referer": "https://finance.sina.com.cn/"}
-            res = requests.get(url, headers=headers, timeout=5).json()
-            
-            data = res.get('result', {}).get('data', [])
-            if data:
-                for doc in data[:limit]:
-                    # 时间戳转换
-                    dt = datetime.fromtimestamp(int(doc['ctime']))
-                    time_str = dt.strftime('%H:%M')
-                    title = doc.get('title', '')
-                    if title:
-                        news_list.append(f"【{time_str}】{title}")
-                log.info(f"新浪新闻获取成功，条数: {len(news_list)}")
-            else:
-                log.warning("新浪新闻接口返回数据为空")
+            token = os.environ.get("TUSHARE_TOKEN", "").strip()
+            if token:
+                import tushare as ts
+                pro = ts.pro_api(token)
+                df = pro.news(src='cls', limit=limit+5)
+                if df is not None and not df.empty:
+                    for _, row in df.iterrows():
+                        time_str = row['datetime'][11:16]
+                        title = row['title'] if row['title'] else row['content'][:50]+"..."
+                        # 过滤无意义简报
+                        if len(title) > 8 and "盘前必读" not in title and "早报" not in title:
+                            news_list.append(f"【{time_str}】{title}")
+                        if len(news_list) >= limit: break
+                    if news_list:
+                        log.info("机构级财联社新闻获取成功")
+                        return news_list
         except Exception as e:
-            log.warning(f"获取新闻失败: {e}", exc_info=True)
+            log.warning(f"Tushare 机构新闻获取失败: {e}")
+
+        # 2. 降级: 新浪 7x24 过滤式财经新闻
+        try:
+            url = "https://feed.mix.sina.com.cn/api/roll/get?pageid=153&lid=2509&k=&num=20&page=1"
+            res = requests.get(url, headers={"Referer": "https://finance.sina.com.cn/"}, timeout=5).json()
+            data = res.get('result', {}).get('data', [])
+            
+            # 高价值新闻关键词
+            keywords = ["政策", "央行", "突发", "利好", "涨停", "大跌", "新规", "会议", "突破", "美联储", "外资"]
+            
+            for doc in data:
+                title = doc.get('title', '')
+                if any(k in title for k in keywords) or len(title) > 20:
+                    dt = datetime.fromtimestamp(int(doc['ctime']))
+                    news_list.append(f"【{dt.strftime('%H:%M')}】{title}")
+                if len(news_list) >= limit: break
+                
+        except Exception as e:
+            log.warning(f"获取新浪新闻兜底失败: {e}")
             
         return news_list
 
@@ -166,10 +184,10 @@ class BriefingRenderer:
         global_strs = []
         for name, data in global_idx.items():
             pct = data['pct']
-            sign = "+" if pct > 0 else ""
-            global_strs.append(f"{name}: {sign}{pct}%")
+            sign = "🔴 " if pct > 0 else ("🟢 " if pct < 0 else "")
+            global_strs.append(f"{name}: {data['price']:.2f} ({sign}{pct:+.2f}%)")
         if global_strs:
-            lines.append("- " + " | ".join(global_strs))
+            lines.append(" • " + "\n • ".join(global_strs))
         else:
             lines.append("- 暂无全球指数实时数据")
             
@@ -177,11 +195,13 @@ class BriefingRenderer:
         lines.append("\n━━━ 🇨🇳 **A股大盘体检** ━━━")
         ashare_strs = []
         for name, data in ashare_idx.items():
-            pct = data['pct']
-            sign = "+" if pct > 0 else ""
-            ashare_strs.append(f"{name}: {sign}{pct}%")
+            pct = data.get('pct', 0.0)
+            sign = "🔴 " if pct > 0 else ("🟢 " if pct < 0 else "")
+            # 若含有 close 可以加上
+            close_val = f"{data['close']:.2f} " if 'close' in data else ""
+            ashare_strs.append(f"{name}: {close_val}({sign}{pct:+.2f}%)")
         if ashare_strs:
-            lines.append("- " + " | ".join(ashare_strs))
+            lines.append(" • " + "\n • ".join(ashare_strs))
         else:
             lines.append("- 暂无A股指数数据")
             

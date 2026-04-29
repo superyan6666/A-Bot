@@ -730,6 +730,7 @@ class AShareTechnicals:
         ema26 = close.ewm(span=26, adjust=False).mean()
         self.df['DIF'] = ema12 - ema26
         self.df['DEA'] = self.df['DIF'].ewm(span=9, adjust=False).mean()
+        self.df['MACD'] = (self.df['DIF'] - self.df['DEA']) * 2
 
         self.df['ATR'], self.df['ADX'] = MathUtils.calc_atr_adx(self.df)
         
@@ -798,7 +799,18 @@ class AShareTechnicals:
         
         vcp_amp, is_true_vcp = MathUtils.calc_vcp_quality(df)
 
+        macd_divergence = False
+        if len(df) >= 40:
+            w1_low = float(df[C.H_LOW].iloc[-40:-20].min())
+            w2_low = float(df[C.H_LOW].iloc[-20:].min())
+            w1_macd_min = float(df['MACD'].iloc[-40:-20].min())
+            w2_macd_min = float(df['MACD'].iloc[-20:].min())
+            if w2_low < w1_low and w2_macd_min > w1_macd_min and w2_macd_min < 0:
+                if float(today.get('ADX', 50)) < 30 or extreme_shrink_vol or is_true_vcp:
+                    macd_divergence = True
+
         return {
+            'macd_divergence': macd_divergence,
             'is_etf': str(row[C.S_CODE]).startswith(('51', '15', '588', '56')),
             'price_pct': price_pct, 'max_1y': max_1y, 'adx': float(today['ADX']),
             'bull_rank': (today['MA20'] > today['MA60']),
@@ -866,6 +878,7 @@ def apply_scoring(data: dict, now: datetime, m_regime: str, vol_surge: bool, win
     in_danger, danger_label = is_earnings_danger_zone(now)
 
     factors = [
+        Factor(lambda d: d.get('macd_divergence', False), 25, 1.0, "- 🧲 **MACD底背离**：日线级别价格创新低但动能衰竭，极其罕见的左侧黄金坑 (触发强加权)"),
         Factor(lambda d: d['mcap'] > 300e8 and 0 < d['pe'] < 25 and d['pb'] < 3, 10, f_val, "- 🏢 **价值蓝筹**：大市值低估值核心资产，防守属性极强"),
         Factor(lambda d: d['vol_ratio'] > 1.0 and d['rs_rating'] > 5, 10, f_mom, "- 🚀 **强势领涨**：近期显著强于大盘，资金接力意愿极强"),
         Factor(lambda d: d['price_pct'] < 0.3 and 0 < d['pb'] < 1.0, 8, f_val, "- ♻️ **困境反转**：股价严重破净且处于绝对低位，安全垫极厚"),

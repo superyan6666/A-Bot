@@ -88,7 +88,8 @@ class HotStockRadar:
                 url = "https://vip.stock.finance.sina.com.cn/q/view/newSinaHy.php"
                 headers = {"Referer": "https://finance.sina.com.cn/"}
                 res = requests.get(url, headers=headers, timeout=5)
-                # var S_KV = {"new_bljc":"玻璃建材,55,13.23,2.45, ..."}
+                res.encoding = 'gbk'
+                # var S_KV = {"new_bljc":"new_bljc,玻璃建材,55,13.23,2.45, ..."}
                 text = res.text.split("=")[1].strip().strip(";")
                 import json
                 data = json.loads(text)
@@ -96,10 +97,10 @@ class HotStockRadar:
                 sectors = []
                 for k, v in data.items():
                     parts = v.split(',')
-                    if len(parts) >= 4:
-                        name = parts[0]
+                    if len(parts) >= 6:
+                        name = parts[1]
                         try:
-                            pct = float(parts[3])
+                            pct = float(parts[5])
                             sectors.append((name, pct))
                         except: pass
                 

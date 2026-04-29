@@ -196,14 +196,10 @@ class MacroJudgmentEngine:
 
             # 美股技术趋势
             us_msg = f"> 📊 **技术动能**: 标普500 5日MTM **{gspc_mtm:+.2f}** (RSI: {gspc_rsi:.1f})\n> 📈 **大盘趋势**: **{gspc_trend_name}** - {gspc_trend_desc}"
-            if gspc_rsi > 70: us_msg += "\n> 🔴 <font color=\"#2fc25b\">(美股动能极度过热，随时面临技术性回调)</font>"
-            elif gspc_rsi < 30: us_msg += "\n> 🟢 <font color=\"#F04864\">(美股恐慌超卖，长线资金建仓点)</font>"
             result["us_tech"] = us_msg
             
             # A股技术趋势
             a_msg = f"> 📊 **技术动能**: 沪深300 5日MTM **{csi300_mtm:+.2f}** (RSI: {csi300_rsi:.1f})\n> 📈 **大盘趋势**: **{csi300_trend_name}** - {csi300_trend_desc}"
-            if csi300_rsi < 30 and csi300_mtm > 0: a_msg += "\n> 🟢 <font color=\"#F04864\">(A股严重超卖且动量拐头，具备左侧博弈价值)</font>"
-            elif csi300_rsi > 70: a_msg += "\n> 🔴 <font color=\"#2fc25b\">(A股逼近超买区，建议规避追涨)</font>"
             result["cn_tech"] = a_msg
 
         except ImportError:
@@ -228,12 +224,12 @@ class NewsDigest:
         if any(w in title for w in anti_words): return -1
         
         # T1 宏观与顶层政策（最高权重，直接定调市场方向）
-        t1_words = ["发改委", "工信部", "央行", "国务院", "新规", "印发", "降准", "降息", "证监会", "政治局", "重磅"]
+        t1_words = ["发改委", "工信部", "央行", "国务院", "新规", "印发", "降准", "降息", "证监会", "政治局", "重磅", "刺激", "利好", "支持"]
         for w in t1_words:
             if w in title: score += 10
             
         # T2 行业前瞻与业绩指引（核心逻辑，决定个股与板块上限）
-        t2_words = ["超预期", "指引", "订单", "需求爆发", "上调", "产能", "供不应求", "扭亏", "净利", "商业化", "突破", "暴增"]
+        t2_words = ["超预期", "指引", "订单", "需求爆发", "上调", "产能", "供不应求", "扭亏", "净利", "商业化", "突破", "暴增", "中标", "合作", "发布", "研发", "获批", "新高"]
         for w in t2_words:
             if w in title: score += 5
             
@@ -250,7 +246,7 @@ class NewsDigest:
             if token:
                 import tushare as ts
                 pro = ts.pro_api(token)
-                df = pro.news(src='cls', limit=limit+30)
+                df = pro.news(src='cls', limit=limit+80)
                 if df is not None and not df.empty:
                     for _, row in df.iterrows():
                         time_str = row['datetime'][11:16]
@@ -271,7 +267,7 @@ class NewsDigest:
 
         # 2. 降级: 新浪 7x24 财经新闻智能提纯
         try:
-            url = "https://feed.mix.sina.com.cn/api/roll/get?pageid=153&lid=2509&k=&num=50&page=1"
+            url = "https://feed.mix.sina.com.cn/api/roll/get?pageid=153&lid=2509&k=&num=80&page=1"
             res = requests.get(url, headers={"Referer": "https://finance.sina.com.cn/"}, timeout=5).json()
             data = res.get('result', {}).get('data', [])
             
@@ -306,14 +302,14 @@ class BriefingRenderer:
         flow_amt, flow_msg = fetch_northbound_flow()
         
         # 3. 新闻摘要
-        news = NewsDigest.get_news(limit=7)
+        news = NewsDigest.get_news(limit=10)
         
         # 渲染 Markdown
         lines = []
         lines.append(f"## 🤖 AI 每日市场简报\n*{date_str}*\n")
         
-        # --- 聪明钱与高阶研判 (置顶呈现) ---
-        lines.append("---\n### 🧠 机构级量化研判 (Smart Money)\n")
+        # --- 大类资产与衍生品 (置顶呈现) ---
+        lines.append("---\n### 🌍 大类资产与衍生品\n")
         if judgments.get("macro"):
             lines.append("\n\n".join(judgments["macro"]))
         else:

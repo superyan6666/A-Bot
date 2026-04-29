@@ -401,6 +401,16 @@ class DataProxy:
     """数据获取多源路由层 (Fallback Waterfall)"""
     def __init__(self):
         self.bs_logged_in = False
+        self.ts_pro = None
+        ts_token = os.environ.get('TUSHARE_TOKEN', '').strip()
+        if ts_token:
+            try:
+                import tushare as ts
+                ts.set_token(ts_token)
+                self.ts_pro = ts.pro_api()
+                log.info("🌟 成功挂载 Tushare Pro 机构级数据核心")
+            except Exception as e:
+                log.warning(f"Tushare 初始化失败: {e}")
 
     def __del__(self):
         if self.bs_logged_in and bs is not None:
@@ -414,8 +424,42 @@ class DataProxy:
 
     # ---- [1. Historical Data] ----
     def _fetch_hist_tushare(self, code, start, end):
-        # TODO: 预留给 Tushare / QMT 实盘高级接口 (最高优)
-        return None
+        if not self.ts_pro: return None
+        try:
+            import tushare as ts
+            ts_code = f"{code}.SH" if code.startswith('6') else f"{code}.SZ"
+            start_fmt = f"{start[:4]}{start[4:6]}{start[6:]}"
+            end_fmt = f"{end[:4]}{end[4:6]}{end[6:]}"
+            df_adj = ts.pro_bar(ts_code=ts_code, api=self.ts_pro, start_date=start_fmt, end_date=end_fmt, adj='qfq')
+            if df_adj is None or df_adj.empty: return None
+            
+            df_adj = df_adj.rename(columns={'trade_date': C.H_DATE, 'open': C.H_OPEN, 'close': C.H_CLOSE, 'high': C.H_HIGH, 'low': C.H_LOW, 'vol': C.H_VOL})
+            df_adj[C.H_DATE] = pd.to_datetime(df_adj[C.H_DATE]).dt.strftime('%Y-%m-%d')
+            df_adj = df_adj.sort_values(C.H_DATE).reset_index(drop=True)
+            for col in [C.H_OPEN, C.H_CLOSE, C.H_HIGH, C.H_LOW, C.H_VOL]:
+                df_adj[col] = pd.to_numeric(df_adj[col], errors='coerce')
+            return df_adj[list(Config.HIST_COLS)]
+        except Exception as e:
+            log.debug(f"[Tier 1 Tushare] 获取历史失败: {e}")
+            return None
+
+    def _get_tushare_fundamentals_df(self) -> pd.DataFrame:
+        if not self.ts_pro: return pd.DataFrame()
+        try:
+            for days_back in range(1, 10):
+                trade_date = (datetime.now() - timedelta(days=days_back)).strftime('%Y%m%d')
+                df = self.ts_pro.daily_basic(trade_date=trade_date)
+                if df is not None and not df.empty:
+                    df[C.S_CODE] = df['ts_code'].str.slice(0, 6)
+                    df[C.S_TURN] = df.get('turnover_rate_f', df.get('turnover_rate', 2.0)).astype(float)
+                    df[C.S_VR] = df.get('volume_ratio', 1.0).astype(float)
+                    df[C.S_PE] = df.get('pe_ttm', -1.0).astype(float)
+                    df[C.S_PB] = df.get('pb', 2.0).astype(float)
+                    df[C.S_MCAP] = df.get('circ_mv', 0.0).astype(float) * 10000
+                    return df[[C.S_CODE, C.S_TURN, C.S_VR, C.S_PE, C.S_PB, C.S_MCAP]]
+        except Exception as e:
+            log.debug(f"Tushare 向量化获取基本面失败: {e}")
+        return pd.DataFrame()
 
     def _fetch_hist_baostock(self, code, start, end):
         if bs is None: return None
@@ -503,9 +547,21 @@ class DataProxy:
                               '涨跌幅': C.S_PCT, '今开': C.S_OPEN, '最高': C.S_HIGH,
                               '最低': C.S_LOW, '成交量': C.S_VOL, '成交额': C.S_AMT}
                 df = df.rename(columns=rename_map)
-                fallback_defaults = {C.S_TURN: 2.0, C.S_MCAP: 100e8, C.S_PE: -1.0, C.S_PB: 2.0, C.S_VR: 1.0}
-                for col, val in fallback_defaults.items():
-                    if col not in df.columns: df[col] = val
+                
+                # --- 向量化融合 Tushare 真实基本面 ---
+                funds_df = self._get_tushare_fundamentals_df()
+                if not funds_df.empty:
+                    df = pd.merge(df, funds_df, on=C.S_CODE, how='left')
+                    df[C.S_TURN] = df[C.S_TURN].fillna(2.0)
+                    df[C.S_MCAP] = df[C.S_MCAP].fillna(100e8)
+                    df[C.S_PE] = df[C.S_PE].fillna(-1.0)
+                    df[C.S_PB] = df[C.S_PB].fillna(2.0)
+                    df[C.S_VR] = df[C.S_VR].fillna(1.0)
+                    log.info("💎 已通过 Tushare 成功向量化修复 Sina 备用源缺失的 PE/VR 等基本面数据。")
+                else:
+                    fallback_defaults = {C.S_TURN: 2.0, C.S_MCAP: 100e8, C.S_PE: -1.0, C.S_PB: 2.0, C.S_VR: 1.0}
+                    for col, val in fallback_defaults.items():
+                        if col not in df.columns: df[col] = val
                 return df
             raise ValueError('spot_empty')
             

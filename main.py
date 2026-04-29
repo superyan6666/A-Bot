@@ -1308,7 +1308,8 @@ def get_signals() -> tuple[list[Signal], list, set, int, str, int]:
             'buy_price': s.price,
             'target': s.target1,
             'stop': s.stop_loss,
-            'status': 'PENDING'
+            'status': 'PENDING',
+            'triggered_factors': s.reasons
         })
     
     save_paper_trades(paper_trades)

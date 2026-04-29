@@ -546,25 +546,53 @@ class DataProxy:
             log.warning(f"获取核心成分股池失败，降级为全市场扫描: {e}")
         return pool
 
-    @retry(times=3, delay=2)
+    @retry(times=2, delay=2)
     def get_hot_sectors(self) -> dict:
         hot_stocks = {}
         try:
             df = ak.stock_board_industry_name_em()
-            if df is None or df.empty: return {}
-            top_sectors = df.nlargest(5, '涨跌幅')['板块名称'].tolist()
-            for sector in top_sectors:
-                try:
-                    time.sleep(0.5) 
-                    cons = ak.stock_board_industry_cons_em(symbol=sector)
-                    if cons is not None and not cons.empty:
-                        col = next((c for c in cons.columns if '代码' in c), None)
-                        if col:
-                            for code in cons[col].astype(str).str.zfill(6).tolist():
-                                hot_stocks[code] = sector
-                except Exception: pass
+            if df is not None and not df.empty:
+                top_sectors = df.nlargest(5, '涨跌幅')['板块名称'].tolist()
+                log.info(f"🌋 (东方财富) 今日领涨主线板块抓取成功: {', '.join(top_sectors)}")
+                for sector in top_sectors:
+                    try:
+                        time.sleep(0.5) 
+                        cons = ak.stock_board_industry_cons_em(symbol=sector)
+                        if cons is not None and not cons.empty:
+                            col = next((c for c in cons.columns if '代码' in c), None)
+                            if col:
+                                for code in cons[col].astype(str).str.zfill(6).tolist():
+                                    hot_stocks[code] = sector
+                    except Exception: pass
+                if hot_stocks: return hot_stocks
         except Exception as e:
-            log.warning(f"主线板块榜单数据获取失败: {e}")
+            log.warning(f"东方财富主线板块榜单获取失败(可能被云端拦截): {e}，正在切换同花顺备用源...")
+
+        # 降级：同花顺源
+        try:
+            df = ak.stock_board_industry_name_ths()
+            if df is not None and not df.empty:
+                name_col = next((c for c in df.columns if '板块' in c or 'name' in c.lower()), None)
+                pct_col = next((c for c in df.columns if '涨跌' in c or 'pct' in c.lower()), None)
+                if name_col and pct_col:
+                    df[pct_col] = pd.to_numeric(df[pct_col], errors='coerce')
+                    top_sectors = df.nlargest(5, pct_col)[name_col].tolist()
+                    log.info(f"🌋 (同花顺) 今日领涨主线板块抓取成功: {', '.join(top_sectors)}")
+                    for sector in top_sectors:
+                        try:
+                            time.sleep(0.5)
+                            cons = ak.stock_board_industry_cons_ths(symbol=sector)
+                            if cons is not None and not cons.empty:
+                                col = next((c for c in cons.columns if '代码' in c or 'code' in c.lower()), None)
+                                if col:
+                                    for code in cons[col].astype(str).str.zfill(6).tolist():
+                                        hot_stocks[code] = sector
+                        except Exception as e:
+                            log.debug(f"同花顺获取板块【{sector}】成分股跳过: {e}")
+                    if hot_stocks: return hot_stocks
+        except Exception as e:
+            log.warning(f"同花顺板块备用源获取也失败: {e}")
+            
         return hot_stocks
 
     @retry(times=2, delay=2)
@@ -866,36 +894,28 @@ def apply_scoring(data: dict, now: datetime, m_regime: str, vol_surge: bool, win
         
     return final_score, level, '\n'.join(reasons)
 
-def prescreen_score(row: pd.Series) -> float:
-    s = 50.0
-    vr = float(row.get(C.S_VR, 1.0))
-    pct = float(row.get(C.S_PCT, 0.0))
-    if vr > 1.5 and pct > 0:
-        s += 15
-    elif vr < 0.7:
-        s -= 10
-        
-    pe = float(row.get(C.S_PE, -1.0))
-    pb = float(row.get(C.S_PB, 99.0))
-    if 0 < pe < 40:
-        s += 8
-    if 0 < pb < 2:
-        s += 5
-        
-    mcap = float(row.get(C.S_MCAP, 0.0))
-    if 50e8 < mcap < 500e8:
-        s += 8
-        
-    amt = float(row.get(C.S_AMT, 0.0))
-    if amt > 1e8:  
-        s += 5
-        
-    if 1.0 < pct < 7.0:
-        s += 10
-    elif pct > 9.0:
-        s -= 15  
-        
-    return min(max(s, 0.0), 100.0)
+def vectorized_prescreen(pool: pd.DataFrame) -> pd.Series:
+    """[性能优化] 向量化预筛分引擎，彻底消除 apply 带来的行级遍历开销"""
+    s = pd.Series(50.0, index=pool.index)
+    
+    vr = pool.get(C.S_VR, pd.Series(1.0, index=pool.index)).fillna(1.0).astype(float)
+    pct = pool.get(C.S_PCT, pd.Series(0.0, index=pool.index)).fillna(0.0).astype(float)
+    pe = pool.get(C.S_PE, pd.Series(-1.0, index=pool.index)).fillna(-1.0).astype(float)
+    pb = pool.get(C.S_PB, pd.Series(99.0, index=pool.index)).fillna(99.0).astype(float)
+    mcap = pool.get(C.S_MCAP, pd.Series(0.0, index=pool.index)).fillna(0.0).astype(float)
+    amt = pool.get(C.S_AMT, pd.Series(0.0, index=pool.index)).fillna(0.0).astype(float)
+    
+    s += np.where((vr > 1.5) & (pct > 0), 15.0, 0.0)
+    s -= np.where(vr < 0.7, 10.0, 0.0)
+    s += np.where((pe > 0) & (pe < 40), 8.0, 0.0)
+    s += np.where((pb > 0) & (pb < 2), 5.0, 0.0)
+    s += np.where((mcap > 50e8) & (mcap < 500e8), 8.0, 0.0)
+    s += np.where(amt > 1e8, 5.0, 0.0)
+    
+    s += np.where((pct > 1.0) & (pct < 7.0), 10.0, 0.0)
+    s -= np.where(pct > 9.0, 15.0, 0.0)
+    
+    return s.clip(lower=0.0, upper=100.0)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1097,9 +1117,14 @@ def get_signals() -> tuple[list[Signal], list, set, int, str, int]:
     
     if len(pool) > 400:
         log.info(f"💡 触发防爆流截断，基于 Spot 截面数据执行廉价预筛分，保留前 400 只高潜标的参与决选。")
-        pool['_pre_score'] = pool.apply(prescreen_score, axis=1)
+        pool['_pre_score'] = vectorized_prescreen(pool)
         pool = pool.sort_values(by='_pre_score', ascending=False).head(400)
         pool = pool.drop(columns=['_pre_score'])
+        
+    # [风控守门人] 全局 NaN 空洞扫描
+    nan_count = pool.isna().sum().sum()
+    if nan_count > len(pool) * 2:
+        log.warning(f"⚠️ [风控预警] 横截面池中存在 {nan_count} 个数据空洞(NaN)，可能会在后续特征计算中引发静默崩塌。")
 
     confirmed_data = [] 
     watchlist_data = [] 

@@ -56,7 +56,6 @@ class MacroBrain:
     @staticmethod
     def get_global_indices():
         indices_data = {}
-        us_tech = {}
         try:
             url = "https://hq.sinajs.cn/list=int_dji,int_nasdaq,int_sp500,b_HSI"
             headers = {"Referer": "https://finance.sina.com.cn/"}
@@ -75,25 +74,8 @@ class MacroBrain:
                         indices_data["恒生指数"] = {"pct": float(parts[6]), "price": float(parts[1])}
         except Exception as e:
             log.warning(f"新浪外盘数据失败: {e}")
-
-        # 获取美股核心科技股 (Mag 7)
-        try:
-            mag7 = ["gb_nvda", "gb_aapl", "gb_msft", "gb_tsla", "gb_googl", "gb_amzn", "gb_meta"]
-            url = f"https://hq.sinajs.cn/list={','.join(mag7)}"
-            headers = {"Referer": "https://finance.sina.com.cn/"}
-            res = requests.get(url, headers=headers, timeout=5)
-            for line in res.text.strip().split('\n'):
-                if '="' in line:
-                    parts = line.split('="')[1].strip('";').split(',')
-                    if len(parts) >= 3:
-                        name = parts[0]
-                        price = float(parts[1])
-                        pct = float(parts[2])
-                        us_tech[name] = {"pct": pct, "price": price}
-        except Exception as e:
-            log.warning(f"获取美股科技龙头失败: {e}")
             
-        return indices_data, us_tech
+        return indices_data
 
 class MacroJudgmentEngine:
     @staticmethod
@@ -111,72 +93,75 @@ class MacroJudgmentEngine:
             import yfinance as yf
             import pandas as pd
             
-            # 使用 yfinance 静默下载高阶宏观数据
-            tickers = yf.Tickers("^TNX ^VIX HG=F GC=F USDCNH=X ^GSPC 000300.SS")
-            # 使用 history 一次性拉取过去1个月的数据以计算技术指标
+            # 引入 ^SKEW (黑天鹅指数) 与 CL=F (原油)
+            tickers = yf.Tickers("^TNX ^VIX ^SKEW HG=F GC=F CL=F USDCNH=X ^GSPC 000300.SS")
             hist = tickers.history(period="1mo")
             close_df = hist['Close']
 
-            # 1. 铜金比 (Copper/Gold Ratio)
-            hg_close = close_df['HG=F'].dropna().iloc[-1]
-            gc_close = close_df['GC=F'].dropna().iloc[-1]
-            cgr = hg_close / gc_close
-            cgr_5d_ago = close_df['HG=F'].dropna().iloc[-6] / close_df['GC=F'].dropna().iloc[-6]
-            cgr_trend = "攀升 (Risk-On)" if cgr > cgr_5d_ago else "回落 (衰退预警)"
+            def get_last(ticker):
+                s = close_df[ticker].dropna()
+                return s.iloc[-1] if not s.empty else 0.0
 
-            # 2. VIX 和 TNX
-            vix = close_df['^VIX'].dropna().iloc[-1]
-            tnx = close_df['^TNX'].dropna().iloc[-1]
+            def get_mtm(ticker, days=5):
+                s = close_df[ticker].dropna()
+                if len(s) > days: return s.iloc[-1] - s.iloc[-days-1]
+                return 0.0
 
-            # 3. 离岸人民币
-            cnh = close_df['USDCNH=X'].dropna().iloc[-1]
-
-            # 4. 技术面 (RSI & MTM)
-            gspc = close_df['^GSPC'].dropna()
+            hg = get_last('HG=F')
+            gc = get_last('GC=F')
+            cl = get_last('CL=F')
+            vix = get_last('^VIX')
+            skew = get_last('^SKEW')
+            tnx = get_last('^TNX')
+            cnh = get_last('USDCNH=X')
+            
+            cgr = (hg / gc) * 100 if gc else 0
+            
+            # --- 1. 大宗与汇率 (Commodities & FX) ---
+            comm_msg = f"**1. 大宗与汇率**\n> 伦敦金 **{gc:.1f}** | WTI原油 **{cl:.1f}** | 离岸人民币 **{cnh:.4f}**\n> 💡 铜金比(宏观复苏先行器) 报 **{cgr:.4f}**"
+            if cnh > 7.25: 
+                comm_msg += "\n> 🔴 <font color=\"#2fc25b\">离岸人民币贬值承压，外资被动流出风险加剧。</font>"
+            judgments.append(comm_msg)
+            
+            # --- 2. 期权与利率 (Options & Rates) ---
+            opt_msg = f"**2. 期权与黑天鹅指标**\n> 美10年期国债 **{tnx:.3f}%** | VIX恐慌指数 **{vix:.2f}** | SKEW黑天鹅指数 **{skew:.1f}**"
+            opt_sub = []
+            if tnx > 4.2: opt_sub.append("🔴 <font color=\"#2fc25b\">美债高企，强力压制全球科技股估值</font>")
+            elif tnx < 3.8: opt_sub.append("🟢 <font color=\"#F04864\">美债回落，成长股迎流动性溢价</font>")
+            
+            if vix < 15: opt_sub.append("🟢 <font color=\"#F04864\">VIX极低，期权市场极度贪婪</font>")
+            elif vix > 20: opt_sub.append("🔴 <font color=\"#2fc25b\">VIX飙升，华尔街大资金已启动对冲</font>")
+            
+            if skew > 135: opt_sub.append("⚠️ <font color=\"#2fc25b\">SKEW 尾部风险指标异动，需防范系统性黑天鹅！</font>")
+            
+            if opt_sub:
+                opt_msg += "\n> " + " \n> ".join(opt_sub)
+            judgments.append(opt_msg)
+            
+            # --- 3. 大盘动能诊断 ---
             csi300 = close_df['000300.SS'].dropna()
-
-            gspc_rsi = MacroJudgmentEngine.calc_rsi(gspc).iloc[-1]
-            gspc_mtm = gspc.iloc[-1] - gspc.iloc[-6] # 5-day momentum
-
-            csi300_rsi = MacroJudgmentEngine.calc_rsi(csi300).iloc[-1]
-            csi300_mtm = csi300.iloc[-1] - csi300.iloc[-6]
-
-            # --- 全球宏观定调 ---
-            macro_msg = f"**【聪明钱底牌】** 铜金比近5日**{cgr_trend}**；VIX 恐慌指数报 **{vix:.2f}** "
-            if vix < 15: macro_msg += "<font color=\"#F04864\">(极度贪婪)</font>；"
-            elif vix > 20: macro_msg += "<font color=\"#2fc25b\">(恐慌对冲)</font>；"
-            else: macro_msg += "(情绪平稳)；"
+            gspc = close_df['^GSPC'].dropna()
             
-            macro_msg += f"美债 10 年期收益率报 **{tnx:.3f}%** "
-            if tnx > 4.2: macro_msg += "🔴 **<font color=\"#2fc25b\">(对全球科技股估值形成强压制)</font>**。"
-            elif tnx < 3.8: macro_msg += "🟢 **<font color=\"#F04864\">(宽松预期发酵，利好成长股)</font>**。"
-            else: macro_msg += "(处于中性震荡区间)。"
+            csi300_rsi = MacroJudgmentEngine.calc_rsi(csi300).iloc[-1] if not csi300.empty else 50
+            gspc_rsi = MacroJudgmentEngine.calc_rsi(gspc).iloc[-1] if not gspc.empty else 50
+            csi300_mtm = get_mtm('000300.SS')
+            gspc_mtm = get_mtm('^GSPC')
+
+            a_msg = f"**3. 中美大盘技术动能**\n> 沪深300 5日MTM **{csi300_mtm:+.2f}** (RSI: {csi300_rsi:.1f})\n> 标普500 5日MTM **{gspc_mtm:+.2f}** (RSI: {gspc_rsi:.1f})"
+            tech_sub = []
+            if csi300_rsi < 30 and csi300_mtm > 0: 
+                tech_sub.append("🟢 <font color=\"#F04864\">A股严重超卖且动量拐头，具备左侧博弈价值</font>")
+            elif csi300_rsi > 70: 
+                tech_sub.append("🔴 <font color=\"#2fc25b\">A股逼近超买区，建议规避追涨</font>")
             
-            judgments.append(macro_msg)
-
-            # --- A股大盘定调 ---
-            a_msg = f"**【A股动能诊断】** 沪深 300 5日动量(MTM)为 **{csi300_mtm:+.2f}**，RSI(14)报 **{csi300_rsi:.1f}**。离岸人民币汇率报 **{cnh:.4f}**。"
-            if csi300_rsi < 30 and csi300_mtm > 0:
-                a_msg += " 🟢 **<font color=\"#F04864\">(超卖且动量拐头，具备极强左侧博弈价值)</font>**。"
-            elif csi300_rsi > 70:
-                a_msg += " 🔴 **<font color=\"#2fc25b\">(进入超买区，建议规避高位追涨，做好防守)</font>**。"
-            elif cnh > 7.25:
-                a_msg += " 🔴 **<font color=\"#2fc25b\">(汇率承压，外资流出压力较大)</font>**。"
-            else:
-                a_msg += " (技术面呈中性，按现有模型执行)。"
-                
-            judgments.append(a_msg)
-
-            # --- 美股大盘定调 ---
-            us_msg = f"**【美股动能诊断】** 标普 500 5日动量(MTM)为 **{gspc_mtm:+.2f}**，RSI(14)报 **{gspc_rsi:.1f}**。"
-            if gspc_rsi > 70:
-                us_msg += " 🔴 **<font color=\"#2fc25b\">(动能极度过热，随时可能迎来技术性回调)</font>**。"
+            if gspc_rsi > 70: 
+                tech_sub.append("🔴 <font color=\"#2fc25b\">美股动能极度过热，随时面临技术性回调</font>")
             elif gspc_rsi < 30:
-                us_msg += " 🟢 **<font color=\"#F04864\">(极度恐慌超卖，聪明钱可能开始逢低建仓)</font>**。"
-            else:
-                us_msg += " (维持原有趋势顺势而为)。"
-                
-            judgments.append(us_msg)
+                tech_sub.append("🟢 <font color=\"#F04864\">美股恐慌超卖，长线资金建仓点</font>")
+            
+            if tech_sub:
+                a_msg += "\n> " + " \n> ".join(tech_sub)
+            judgments.append(a_msg)
 
         except ImportError:
             log.warning("yfinance 或 pandas 未安装，跳过高阶宏观研判")
@@ -269,13 +254,13 @@ class BriefingRenderer:
     def render() -> str:
         date_str = _today_str()
         
-        # 1. 宏观数据
-        ashare_idx = MacroBrain.get_ashare_indices()
-        global_idx, us_tech = MacroBrain.get_global_indices()
-        flow_amt, flow_msg = fetch_northbound_flow()
-        
-        # 2. 宏观高阶研判
+        # 1. 宏观高阶研判 (置顶)
         judgments = MacroJudgmentEngine.get_judgments()
+        
+        # 2. 宏观数据
+        ashare_idx = MacroBrain.get_ashare_indices()
+        global_idx = MacroBrain.get_global_indices()
+        flow_amt, flow_msg = fetch_northbound_flow()
         
         # 3. 新闻摘要
         news = NewsDigest.get_news(limit=7)
@@ -284,8 +269,16 @@ class BriefingRenderer:
         lines = []
         lines.append(f"## 🤖 AI 每日市场简报\n*{date_str}*\n")
         
+        # --- 聪明钱与高阶研判 (置顶呈现) ---
+        lines.append("---\n### 🧠 机构级量化研判 (Smart Money)\n")
+        if judgments:
+            # 针对钉钉优化：用双换行拆分段落
+            lines.append("\n\n".join(judgments))
+        else:
+            lines.append("> <font color=\"#8c8c8c\">研判引擎暂无数据输出</font>")
+            
         # --- 全球宏观 ---
-        lines.append("---\n### 🌍 全球宏观雷达")
+        lines.append("\n---\n### 🌍 全球宏观雷达")
         global_strs = []
         for name, data in global_idx.items():
             pct = data['pct']
@@ -295,13 +288,6 @@ class BriefingRenderer:
             lines.extend(global_strs)
         else:
             lines.append("- <font color=\"#8c8c8c\">暂无实时数据</font>")
-            
-        # 美股核心科技股 (US Tech Leaders)
-        if us_tech:
-            us_tech_strs = []
-            for name, data in us_tech.items():
-                us_tech_strs.append(f"{name} {format_dingtalk_pct(data['pct'], is_us=True)}")
-            lines.append(f"> 🇺🇸 **美股核心科技**: " + " | ".join(us_tech_strs))
             
         # --- A股大盘 ---
         lines.append("\n### 🇨🇳 A股大盘体检")
@@ -317,14 +303,6 @@ class BriefingRenderer:
             
         if flow_msg:
             lines.append(f"\n{flow_msg.strip()}")
-            
-        # --- 聪明钱与高阶研判 ---
-        lines.append("\n### 🧠 高阶量化研判 (Smart Money)")
-        if judgments:
-            for j in judgments:
-                lines.append(f"> {j}")
-        else:
-            lines.append("> <font color=\"#8c8c8c\">研判引擎暂无数据输出</font>")
             
         # --- 市场热点 ---
         lines.append("\n### 📰 核心投研资讯")

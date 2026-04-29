@@ -21,13 +21,16 @@ class MacroBrain:
         try:
             df = ak.stock_zh_index_spot_em()
             if df is not None and not df.empty:
-                for code, name in [("000300", "沪深300"), ("399006", "创业板指"), ("000001", "上证指数")]:
-                    row = df[df["代码"] == code]
+                log.info(f"A股大盘获取成功，总行数: {len(df)}，包含列: {df.columns.tolist()}")
+                for name_kw, target_name in [("沪深300", "沪深300"), ("创业板指", "创业板指"), ("上证指数", "上证指数")]:
+                    row = df[df["名称"].str.contains(name_kw, na=False)]
                     if not row.empty:
-                        indices_data[name] = {
+                        indices_data[target_name] = {
                             "pct": float(row.iloc[0]["涨跌幅"]),
                             "close": float(row.iloc[0]["最新价"])
                         }
+            else:
+                log.warning("ak.stock_zh_index_spot_em() 返回为空")
         except Exception as e:
             log.warning(f"获取A股大盘指数失败: {e}")
         return indices_data
@@ -39,23 +42,24 @@ class MacroBrain:
         try:
             df_hk = ak.stock_hk_spot_em()
             if df_hk is not None and not df_hk.empty:
-                row = df_hk[df_hk["代码"] == "800000"] # 恒生指数代码可能变化，备选：直接用 yfinance 或放弃。使用akshare尽量兼容
+                log.info(f"港股获取成功，总行数: {len(df_hk)}")
+                row = df_hk[df_hk["名称"].str.contains("恒生指数", na=False)]
                 if not row.empty:
                     indices_data["恒生指数"] = {"pct": float(row.iloc[0]["涨跌幅"])}
-        except Exception:
-            pass
+        except Exception as e:
+            log.warning(f"港股数据失败: {e}")
 
         # 美股指数
         try:
             df_us = ak.stock_us_spot_em()
             if df_us is not None and not df_us.empty:
-                # 纳斯达克 100 或 标普 500
-                for code, name in [("105.NDX", "纳斯达克"), ("105.SPX", "标普500")]:
-                    row = df_us[df_us["代码"] == code]
+                log.info(f"美股获取成功，总行数: {len(df_us)}")
+                for name_kw, target_name in [("纳斯达克", "纳斯达克"), ("标普500", "标普500"), ("道琼斯", "道琼斯")]:
+                    row = df_us[df_us["名称"].str.contains(name_kw, na=False)]
                     if not row.empty:
-                        indices_data[name] = {"pct": float(row.iloc[0]["涨跌幅"])}
-        except Exception:
-            pass
+                        indices_data[target_name] = {"pct": float(row.iloc[0]["涨跌幅"])}
+        except Exception as e:
+            log.warning(f"美股数据失败: {e}")
             
         return indices_data
 
@@ -63,14 +67,16 @@ class HotStockRadar:
     @staticmethod
     def get_hot_overview(limit=5):
         try:
+            log.info("开始拉取 fetch_hot_sectors()")
             hot_stocks = fetch_hot_sectors()
-            # hot_stocks 结构为: {code: sector_name}
-            # 我们需要统计各个板块的热度
+            log.info(f"fetch_hot_sectors() 返回个股数量: {len(hot_stocks) if hot_stocks else 0}")
+            if not hot_stocks:
+                return []
+                
             sector_counts = {}
             for code, sector in hot_stocks.items():
                 sector_counts[sector] = sector_counts.get(sector, 0) + 1
             
-            # 按成分股数量排序
             sorted_sectors = sorted(sector_counts.items(), key=lambda x: x[1], reverse=True)
             return [s[0] for s in sorted_sectors[:limit]]
         except Exception as e:
@@ -80,19 +86,25 @@ class HotStockRadar:
 class NewsDigest:
     @staticmethod
     def get_news(limit=5):
-        # 尝试使用 THS MCP (此处预留网络探测与调用逻辑)
-        # 实际运行中由于没有官方 client SDK 暂用 akshare 财联社电报兜底
         log.info("尝试拉取最新市场新闻...")
         news_list = []
         try:
-            # 降级：使用财联社电报
             df = ak.stock_telegraph_cls()
             if df is not None and not df.empty:
-                # 过滤出有标题的新闻
-                df = df[df["标题"].str.len() > 0]
-                df = df.head(limit)
-                for _, row in df.iterrows():
-                    news_list.append(f"【{row['发布时间']}】{row['标题']}")
+                log.info(f"财联社电报获取成功，列名: {df.columns.tolist()}，数据行数: {len(df)}")
+                # 兼容旧版本可能只有 'title' 没有 '标题' 的问题
+                col_title = "标题" if "标题" in df.columns else "title"
+                col_time = "发布时间" if "发布时间" in df.columns else "time"
+                
+                if col_title in df.columns and col_time in df.columns:
+                    df = df[df[col_title].astype(str).str.len() > 0]
+                    df = df.head(limit)
+                    for _, row in df.iterrows():
+                        news_list.append(f"【{row[col_time]}】{row[col_title]}")
+                else:
+                    log.warning(f"找不到预期的列名，放弃新闻提取。存在列: {df.columns.tolist()}")
+            else:
+                log.warning("财联社电报接口返回为空")
         except Exception as e:
             log.warning(f"获取新闻兜底失败: {e}")
             

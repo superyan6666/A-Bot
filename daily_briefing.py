@@ -56,6 +56,7 @@ class MacroBrain:
     @staticmethod
     def get_global_indices():
         indices_data = {}
+        us_tech = {}
         try:
             url = "https://hq.sinajs.cn/list=int_dji,int_nasdaq,int_sp500,b_HSI"
             headers = {"Referer": "https://finance.sina.com.cn/"}
@@ -74,8 +75,25 @@ class MacroBrain:
                         indices_data["恒生指数"] = {"pct": float(parts[6]), "price": float(parts[1])}
         except Exception as e:
             log.warning(f"新浪外盘数据失败: {e}")
+
+        # 获取美股核心科技股 (Mag 7)
+        try:
+            mag7 = ["gb_nvda", "gb_aapl", "gb_msft", "gb_tsla", "gb_googl", "gb_amzn", "gb_meta"]
+            url = f"https://hq.sinajs.cn/list={','.join(mag7)}"
+            headers = {"Referer": "https://finance.sina.com.cn/"}
+            res = requests.get(url, headers=headers, timeout=5)
+            for line in res.text.strip().split('\n'):
+                if '="' in line:
+                    parts = line.split('="')[1].strip('";').split(',')
+                    if len(parts) >= 3:
+                        name = parts[0]
+                        price = float(parts[1])
+                        pct = float(parts[2])
+                        us_tech[name] = {"pct": pct, "price": price}
+        except Exception as e:
+            log.warning(f"获取美股科技龙头失败: {e}")
             
-        return indices_data
+        return indices_data, us_tech
 
 class HotStockRadar:
     @staticmethod
@@ -103,25 +121,40 @@ class HotStockRadar:
                 sectors = []
                 for k, v in data.items():
                     parts = v.split(',')
-                    if len(parts) >= 13:
+                    if len(parts) >= 6:
+                        node_code = parts[0]
                         name = parts[1]
                         try:
-                            ldr_name = parts[12]
-                            # 机构风控：如果板块龙头是 ST 股，说明该板块是垃圾股炒作，直接过滤该板块
-                            if "ST" in ldr_name.upper():
-                                continue
-                                
                             pct = float(parts[5])
-                            ldr_pct = float(parts[11])
-                            sectors.append((name, pct, ldr_name, ldr_pct))
+                            sectors.append((node_code, name, pct))
                         except: pass
                 
-                sectors.sort(key=lambda x: x[1], reverse=True)
+                sectors.sort(key=lambda x: x[2], reverse=True)
                 # 过滤涨幅极小的无意义板块
-                sectors = [s for s in sectors if s[1] > 0.5]
+                sectors = [s for s in sectors if s[2] > 0.5]
                 top_sectors = []
+                
                 for s in sectors[:limit]:
-                    top_sectors.append(f"**{s[0]}** {format_dingtalk_pct(s[1])} ➜ 👑 龙头: **{s[2]}** {format_dingtalk_pct(s[3])}")
+                    node_code, name, pct = s
+                    top_3_stocks = []
+                    try:
+                        # 动态获取板块前3龙头
+                        node_url = f"https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData?page=1&num=4&sort=changepercent&asc=0&node={node_code}"
+                        node_res = requests.get(node_url, timeout=3).json()
+                        for st in node_res:
+                            st_name = st.get('name', '')
+                            # 过滤 ST 股
+                            if "ST" in st_name.upper(): continue
+                            st_pct = float(st.get('changepercent', 0.0))
+                            top_3_stocks.append(f"{st_name} {format_dingtalk_pct(st_pct)}")
+                            if len(top_3_stocks) >= 3: break
+                    except Exception as e:
+                        log.warning(f"获取板块 {name} 龙头失败: {e}")
+                        
+                    if top_3_stocks:
+                        stocks_str = " | ".join(top_3_stocks)
+                        top_sectors.append(f"**{name}** {format_dingtalk_pct(pct)} ➜ 👑 {stocks_str}")
+                        
                 return top_sectors
 
         except Exception as e:
@@ -213,7 +246,7 @@ class BriefingRenderer:
         
         # 1. 宏观数据
         ashare_idx = MacroBrain.get_ashare_indices()
-        global_idx = MacroBrain.get_global_indices()
+        global_idx, us_tech = MacroBrain.get_global_indices()
         flow_amt, flow_msg = fetch_northbound_flow()
         
         # 2. 热门板块
@@ -237,6 +270,13 @@ class BriefingRenderer:
             lines.extend(global_strs)
         else:
             lines.append("- <font color=\"#8c8c8c\">暂无实时数据</font>")
+            
+        # 美股核心科技股 (US Tech Leaders)
+        if us_tech:
+            us_tech_strs = []
+            for name, data in us_tech.items():
+                us_tech_strs.append(f"{name} {format_dingtalk_pct(data['pct'], is_us=True)}")
+            lines.append(f"> 🇺🇸 **美股核心科技**: " + " | ".join(us_tech_strs))
             
         # --- A股大盘 ---
         lines.append("\n### 🇨🇳 A股大盘体检")

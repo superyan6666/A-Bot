@@ -125,24 +125,30 @@ class MacroJudgmentEngine:
             cgr = (hg / gc) * 100 if gc else 0
             
             # --- 1. 大宗与汇率 (Commodities & FX) ---
-            comm_msg = f"**1. 大宗与汇率**\n> 纽约期金 **{gc:.1f}** | WTI原油 **{cl:.1f}** | 离岸人民币 **{cnh:.4f}**\n> 💡 铜金比(宏观复苏先行器) 报 **{cgr:.4f}**"
+            comm_msg = f"**1. 大宗与汇率**\n> 纽约期金 **{gc:.1f}** | WTI原油 **{cl:.1f}**"
+            cnh_str = f"\n> 离岸人民币 **{cnh:.4f}**"
             if cnh > 7.25: 
-                comm_msg += "\n> 🔴 <font color=\"#2fc25b\">离岸人民币贬值承压，外资被动流出风险加剧。</font>"
+                cnh_str += " 🔴 <font color=\"#2fc25b\">(离岸人民币贬值承压，外资被动流出风险加剧)</font>"
+            
+            cgr_str = f"\n> 💡 铜金比(宏观复苏先行器) **{cgr:.4f}**"
+            comm_msg += cnh_str + cgr_str
             result["macro"].append(comm_msg)
             
             # --- 2. 期权与利率 (Options & Rates) ---
-            opt_msg = f"**2. 期权与黑天鹅指标**\n> 美10年期国债 **{tnx:.3f}%** | VIX恐慌指数 **{vix:.2f}** | SKEW黑天鹅指数 **{skew:.1f}**"
-            opt_sub = []
-            if tnx > 4.2: opt_sub.append("🔴 <font color=\"#2fc25b\">美债高企，强力压制全球科技股估值</font>")
-            elif tnx < 3.8: opt_sub.append("🟢 <font color=\"#F04864\">美债回落，成长股迎流动性溢价</font>")
+            opt_msg = "**2. 期权与黑天鹅指标**"
             
-            if vix < 15: opt_sub.append("🟢 <font color=\"#F04864\">VIX极低，期权市场极度贪婪</font>")
-            elif vix > 20: opt_sub.append("🔴 <font color=\"#2fc25b\">VIX飙升，华尔街大资金已启动对冲</font>")
+            tnx_str = f"\n> 美10年期国债 **{tnx:.3f}%**"
+            if tnx > 4.2: tnx_str += " 🔴 <font color=\"#2fc25b\">(美债高企，强力压制全球科技股估值)</font>"
+            elif tnx < 3.8: tnx_str += " 🟢 <font color=\"#F04864\">(美债回落，成长股迎流动性溢价)</font>"
             
-            if skew > 135: opt_sub.append("⚠️ <font color=\"#2fc25b\">SKEW 尾部风险指标异动，需防范系统性黑天鹅！</font>")
+            vix_str = f"\n> VIX恐慌指数 **{vix:.2f}**"
+            if vix < 15: vix_str += " 🟢 <font color=\"#F04864\">(期权市场极度贪婪)</font>"
+            elif vix > 20: vix_str += " 🔴 <font color=\"#2fc25b\">(华尔街大资金已启动对冲)</font>"
             
-            if opt_sub:
-                opt_msg += "\n> " + " \n> ".join(opt_sub)
+            skew_str = f"\n> SKEW黑天鹅指数 **{skew:.1f}**"
+            if skew > 135: skew_str += " ⚠️ <font color=\"#2fc25b\">(尾部风险指标异动，需防范系统性黑天鹅！)</font>"
+            
+            opt_msg += tnx_str + vix_str + skew_str
             result["macro"].append(opt_msg)
             
             # --- 3. 大盘动能诊断 ---
@@ -319,9 +325,9 @@ class BriefingRenderer:
             lines.append(f"\n> 💰 **北向资金**: {flow_msg.strip().replace('北向资金: ', '')}")
             
         # --- 市场热点 ---
-        lines.append("\n### 📰 核心投研资讯")
+        lines.append("\n### 📰 核心投研资讯\n")
         if news:
-            lines.extend(news)
+            lines.append("\n\n".join(news))
         else:
             lines.append("> <font color=\"#8c8c8c\">暂无重大新闻</font>")
             

@@ -834,7 +834,7 @@ class Factor:
     weight: float = 1.0
     template: str = ""
 
-def apply_scoring(data: dict, now: datetime, m_regime: str, vol_surge: bool, win_stats: dict) -> tuple[int, str, str]:
+def apply_scoring(data: dict, now: datetime, m_regime: str, vol_surge: bool, win_stats: dict, is_fallback: bool = False) -> tuple[int, str, str]:
     adx = data['adx']
     tw, rw = (1.4, 0.7) if adx > 25 else (0.8, 1.4) if adx < 15 else (1.0, 1.0)
     
@@ -922,6 +922,10 @@ def apply_scoring(data: dict, now: datetime, m_regime: str, vol_surge: bool, win
                 reasons.append(f.template.format(**data))
             except KeyError:
                 reasons.append(f.template)
+                
+    if is_fallback:
+        raw_score += 25
+        reasons.append("- 🛟 **[失明补偿]**：因基本面数据链断裂，系统强行加权 25 分以维持基础纯形态决选。")
 
     raw_score = max(0, min(raw_score, 100))
     
@@ -950,7 +954,7 @@ def apply_scoring(data: dict, now: datetime, m_regime: str, vol_surge: bool, win
         
     return final_score, level, '\n'.join(reasons)
 
-def vectorized_prescreen(pool: pd.DataFrame) -> pd.Series:
+def vectorized_prescreen(pool: pd.DataFrame, is_fallback: bool = False) -> pd.Series:
     """[性能优化] 向量化预筛分引擎，彻底消除 apply 带来的行级遍历开销"""
     s = pd.Series(50.0, index=pool.index)
     
@@ -971,6 +975,9 @@ def vectorized_prescreen(pool: pd.DataFrame) -> pd.Series:
     s += np.where((pct > 1.0) & (pct < 7.0), 10.0, 0.0)
     s -= np.where(pct > 9.0, 15.0, 0.0)
     
+    if is_fallback:
+        s += 20.0
+        
     return s.clip(lower=0.0, upper=100.0)
 
 
@@ -1173,7 +1180,7 @@ def get_signals() -> tuple[list[Signal], list, set, int, str, int]:
     
     if len(pool) > 400:
         log.info(f"💡 触发防爆流截断，基于 Spot 截面数据执行廉价预筛分，保留前 400 只高潜标的参与决选。")
-        pool['_pre_score'] = vectorized_prescreen(pool)
+        pool['_pre_score'] = vectorized_prescreen(pool, is_fallback)
         pool = pool.sort_values(by='_pre_score', ascending=False).head(400)
         pool = pool.drop(columns=['_pre_score'])
         
@@ -1199,7 +1206,7 @@ def get_signals() -> tuple[list[Signal], list, set, int, str, int]:
                 if result:
                     data, stop, risk = result
                     
-                    score, level, reas = apply_scoring(data, now, m_regime, vol_surge, win_stats)
+                    score, level, reas = apply_scoring(data, now, m_regime, vol_surge, win_stats, is_fallback)
                     
                     if score >= 70: 
                         target1_price = calc_target_price(row[C.S_PRICE], stop, data)

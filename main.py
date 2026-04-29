@@ -721,7 +721,7 @@ class AShareTechnicals:
         close = self.df[C.H_CLOSE]
         high, low, vol = self.df[C.H_HIGH], self.df[C.H_LOW], self.df[C.H_VOL]
         
-        for span in (10, 20, 60): 
+        for span in (5, 10, 20, 60): 
             self.df[f'MA{span}'] = close.rolling(span).mean()
         self.df['MA5_V'] = vol.rolling(5).mean()
         self.df['MA20_V'] = vol.rolling(20).mean()
@@ -809,7 +809,25 @@ class AShareTechnicals:
                 if float(today.get('ADX', 50)) < 30 or extreme_shrink_vol or is_true_vcp:
                     macd_divergence = True
 
+        recent_consec_zt = False
+        if len(df) >= 5:
+            recent_consec_zt = bool(((df['PCT_CHG'].iloc[-6:-1] >= 9.5).rolling(2).sum() >= 2).any())
+
+        is_first_dip = False
+        if recent_consec_zt:
+            today_is_green = today[C.H_CLOSE] < today[C.H_OPEN] or float(df['PCT_CHG'].iloc[-1]) < 0
+            yest_is_red = yest[C.H_CLOSE] >= yest[C.H_OPEN]
+            
+            above_ma5 = today[C.H_CLOSE] >= today['MA5']
+            no_nuclear = float(df['PCT_CHG'].iloc[-1]) > -6.5
+            no_trap = upper_shadow_pct < 20.0
+            vol_shrink = today[C.H_VOL] <= yest[C.H_VOL] * 1.1
+            
+            if today_is_green and yest_is_red and above_ma5 and no_nuclear and no_trap and vol_shrink:
+                is_first_dip = True
+
         return {
+            'is_first_dip': is_first_dip,
             'macd_divergence': macd_divergence,
             'is_etf': str(row[C.S_CODE]).startswith(('51', '15', '588', '56')),
             'price_pct': price_pct, 'max_1y': max_1y, 'adx': float(today['ADX']),
@@ -921,7 +939,8 @@ def apply_scoring(data: dict, now: datetime, m_regime: str, vol_surge: bool, win
         Factor(lambda d: d.get('rsi', 50) > 80, -10, f_risk, "- 🌡️ **短期过热**：RSI偏高短线超买，操作需要进一步缩减仓位"),
         Factor(lambda d: d.get('rs_rating', 0) < -10, -8, f_risk, "- 📉 **跑输大盘**：近期持续弱于大盘，跟的是被冷落的股票"),
         Factor(lambda d: d['has_consecutive_zt'] and d['price_pct'] < 0.40, 10, f_mom, "- 🔥 **低位连板**：刚刚启动的龙头，安全且市场辨识度极高"),
-        Factor(lambda d: d['has_consecutive_zt'] and d['price_pct'] >= 0.90, -15, f_risk, "- ⚠️ **高位接盘**：股价已被炒高连板，千万别追容易接盘！"),
+        Factor(lambda d: d['has_consecutive_zt'] and d['price_pct'] >= 0.90 and not (d.get('is_first_dip', False) and m_regime != 'BEAR'), -15, f_risk, "- ⚠️ **高位接盘**：股价已被炒高连板，千万别追容易接盘！"),
+        Factor(lambda d: d.get('is_first_dip', False) and m_regime != 'BEAR', 20, f_mom, "- 🐉 **龙头首阴**：连板龙头首次缩量温和回调，量价健康且未破5日线，游资经典极品接力点！"),
         Factor(lambda d: d['upper_shadow_pct'] > 35, -15, f_risk, "- ⚠️ **诱多预警**：冲高后大幅跳水，上方抛压极重别上当！"),
         Factor(lambda d: d['dist_ma20'] > 25, -15, f_risk, "- 🚫 **追高预警**：目前涨得太急离均线太远，随时面临暴跌回调"),
         

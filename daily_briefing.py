@@ -130,45 +130,71 @@ class HotStockRadar:
 
 class NewsDigest:
     @staticmethod
+    def score_news(title):
+        score = 0
+        # 黑名单屏蔽：高管人事变动、例行会议、互动平台灌水、纯粹的早报归纳
+        anti_words = ["高管", "辞职", "离职", "聘任", "董事", "股东大会", "互动平台", "早报", "必读", "提示性公告"]
+        if any(w in title for w in anti_words): return -1
+        
+        # T1 宏观与顶层政策（最高权重，直接定调市场方向）
+        t1_words = ["发改委", "工信部", "央行", "国务院", "新规", "印发", "降准", "降息", "证监会", "政治局", "重磅"]
+        for w in t1_words:
+            if w in title: score += 10
+            
+        # T2 行业前瞻与业绩指引（核心逻辑，决定个股与板块上限）
+        t2_words = ["超预期", "指引", "订单", "需求爆发", "上调", "产能", "供不应求", "扭亏", "净利", "商业化", "突破", "暴增"]
+        for w in t2_words:
+            if w in title: score += 5
+            
+        return score
+
+    @staticmethod
     def get_news(limit=5):
         news_list = []
+        scored_news = []
         
-        # 1. 首选: Tushare 机构级财联社电报 (过滤水文)
+        # 1. 首选: Tushare 机构级财联社电报
         try:
             token = os.environ.get("TUSHARE_TOKEN", "").strip()
             if token:
                 import tushare as ts
                 pro = ts.pro_api(token)
-                df = pro.news(src='cls', limit=limit+5)
+                df = pro.news(src='cls', limit=limit+30)
                 if df is not None and not df.empty:
                     for _, row in df.iterrows():
                         time_str = row['datetime'][11:16]
                         title = row['title'] if row['title'] else row['content'][:50]+"..."
-                        # 过滤无意义简报
-                        if len(title) > 8 and "盘前必读" not in title and "早报" not in title:
+                        score = NewsDigest.score_news(title)
+                        if score > 0:
+                            # 加入时间戳辅助排序，同分的情况下越新的排越前面
+                            scored_news.append((score, row['datetime'], time_str, title))
+                            
+                    if scored_news:
+                        scored_news.sort(key=lambda x: (x[0], x[1]), reverse=True)
+                        for _, _, time_str, title in scored_news[:limit]:
                             news_list.append(f"> **[{time_str}]** {title}")
-                        if len(news_list) >= limit: break
-                    if news_list:
-                        log.info("机构级财联社新闻获取成功")
+                        log.info(f"机构级财联社新闻智能提纯成功，获取 {len(news_list)} 条高价值资讯")
                         return news_list
         except Exception as e:
             log.warning(f"Tushare 机构新闻获取失败: {e}")
 
-        # 2. 降级: 新浪 7x24 过滤式财经新闻
+        # 2. 降级: 新浪 7x24 财经新闻智能提纯
         try:
-            url = "https://feed.mix.sina.com.cn/api/roll/get?pageid=153&lid=2509&k=&num=20&page=1"
+            url = "https://feed.mix.sina.com.cn/api/roll/get?pageid=153&lid=2509&k=&num=50&page=1"
             res = requests.get(url, headers={"Referer": "https://finance.sina.com.cn/"}, timeout=5).json()
             data = res.get('result', {}).get('data', [])
             
-            # 高价值新闻关键词
-            keywords = ["政策", "央行", "突发", "利好", "涨停", "大跌", "新规", "会议", "突破", "美联储", "外资"]
-            
             for doc in data:
                 title = doc.get('title', '')
-                if any(k in title for k in keywords) or len(title) > 20:
+                score = NewsDigest.score_news(title)
+                if score > 0:
                     dt = datetime.fromtimestamp(int(doc['ctime']))
-                    news_list.append(f"> **[{dt.strftime('%H:%M')}]** {title}")
-                if len(news_list) >= limit: break
+                    scored_news.append((score, doc['ctime'], dt.strftime('%H:%M'), title))
+                    
+            if scored_news:
+                scored_news.sort(key=lambda x: (x[0], x[1]), reverse=True)
+                for _, _, time_str, title in scored_news[:limit]:
+                    news_list.append(f"> **[{time_str}]** {title}")
                 
         except Exception as e:
             log.warning(f"获取新浪新闻兜底失败: {e}")

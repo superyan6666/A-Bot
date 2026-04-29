@@ -4,10 +4,12 @@ on:
   schedule:
     # 提前至北京时间 14:45 触发 (尾盘买入法)，预留 Github Actions 队列排队延迟
     - cron: '45 6 * * 1-5'
+    # 提前至北京时间 09:35 触发 (早盘宏观与主线播报)
+    - cron: '35 1 * * 1-5'
   workflow_dispatch:
     inputs:
       run_mode:
-        description: '运行模式 (全量量化扫描 / 仅大盘体检播报 / 仅测试连通性)'
+        description: '运行模式 (全量量化扫描 / 仅大盘体检 / 测试连通性 / 早盘播报)'
         required: true
         default: 'normal'
         type: choice
@@ -15,6 +17,7 @@ on:
           - normal
           - market_only
           - test_conn
+          - briefing
       push_empty:
         description: '是否在无信号时也推送大盘状态报告？'
         required: false
@@ -68,6 +71,13 @@ jobs:
           PYTHONIOENCODING: "utf-8"
           PYTHONUNBUFFERED: "1"
         run: |
+          # 自动分发调度模式
+          if [ "${{ github.event.schedule }}" == "35 1 * * 1-5" ]; then
+            RUN_MODE="briefing"
+          elif [ "${{ github.event.schedule }}" == "45 6 * * 1-5" ]; then
+            RUN_MODE="normal"
+          fi
+
           if [ "$RUN_MODE" == "test_conn" ]; then
             echo "🔔 检测到测试模式，执行钉钉连通性推送..."
             # 【逻辑梳理】：采用安全的 Here-Doc 语法，避免 Bash 单双引号转义冲突引发崩溃
@@ -82,6 +92,9 @@ jobs:
           res = requests.post(webhook, json={'msgtype': 'text', 'text': {'content': msg}}, timeout=10)
           print('✅ 推送结果:', res.text)
           EOF
+          elif [ "$RUN_MODE" == "briefing" ]; then
+            echo "📊 启动早盘宏观与热门主线播报 Agent..."
+            python daily_briefing.py
           elif [ "$RUN_MODE" == "market_only" ]; then
             echo "📊 检测到大盘体检模式，开始扫描宏观资金与情绪指标..."
             python main.py

@@ -106,8 +106,12 @@ class HotStockRadar:
                     if len(parts) >= 13:
                         name = parts[1]
                         try:
-                            pct = float(parts[5])
                             ldr_name = parts[12]
+                            # 机构风控：如果板块龙头是 ST 股，说明该板块是垃圾股炒作，直接过滤该板块
+                            if "ST" in ldr_name.upper():
+                                continue
+                                
+                            pct = float(parts[5])
                             ldr_pct = float(parts[11])
                             sectors.append((name, pct, ldr_name, ldr_pct))
                         except: pass

@@ -427,10 +427,11 @@ class DataProxy:
         if not self.ts_pro: return None
         try:
             import tushare as ts
-            ts_code = f"{code}.SH" if code.startswith('6') else f"{code}.SZ"
+            ts_code = f"{code}.SH" if code.startswith(('6', '5')) else f"{code}.SZ"
             start_fmt = f"{start[:4]}{start[4:6]}{start[6:]}"
             end_fmt = f"{end[:4]}{end[4:6]}{end[6:]}"
-            df_adj = ts.pro_bar(ts_code=ts_code, api=self.ts_pro, start_date=start_fmt, end_date=end_fmt, adj='qfq')
+            asset_type = 'FD' if code.startswith(('51', '15', '588', '56')) else 'E'
+            df_adj = ts.pro_bar(ts_code=ts_code, api=self.ts_pro, start_date=start_fmt, end_date=end_fmt, adj='qfq', asset=asset_type)
             if df_adj is None or df_adj.empty: return None
             
             df_adj = df_adj.rename(columns={'trade_date': C.H_DATE, 'open': C.H_OPEN, 'close': C.H_CLOSE, 'high': C.H_HIGH, 'low': C.H_LOW, 'vol': C.H_VOL})
@@ -798,6 +799,7 @@ class AShareTechnicals:
         vcp_amp, is_true_vcp = MathUtils.calc_vcp_quality(df)
 
         return {
+            'is_etf': str(row[C.S_CODE]).startswith(('51', '15', '588', '56')),
             'price_pct': price_pct, 'max_1y': max_1y, 'adx': float(today['ADX']),
             'bull_rank': (today['MA20'] > today['MA60']),
             'extreme_shrink_vol': extreme_shrink_vol,
@@ -923,7 +925,10 @@ def apply_scoring(data: dict, now: datetime, m_regime: str, vol_surge: bool, win
             except KeyError:
                 reasons.append(f.template)
                 
-    if is_fallback:
+    if data.get('is_etf', False):
+        raw_score += 25
+        reasons.append("- 🧬 **[ETF 纯血通道]**：触发专属被动基金过滤逻辑，跳过基本面考核，执行纯形态打分 (+25分)。")
+    elif is_fallback:
         raw_score += 25
         reasons.append("- 🛟 **[失明补偿]**：因基本面数据链断裂，系统强行加权 25 分以维持基础纯形态决选。")
 
@@ -977,6 +982,9 @@ def vectorized_prescreen(pool: pd.DataFrame, is_fallback: bool = False) -> pd.Se
     
     if is_fallback:
         s += 20.0
+        
+    is_etf = pool.index.astype(str).str.startswith(('51', '15', '588', '56'))
+    s += np.where(is_etf, 20.0, 0.0)
         
     return s.clip(lower=0.0, upper=100.0)
 
@@ -1159,19 +1167,22 @@ def get_signals() -> tuple[list[Signal], list, set, int, str, int]:
         log.info(f"💎 已开启【核心优质股池】模式，限定扫描 {len(core_pool)} 只国家队核心及高弹性成分股。")
 
     is_fallback = (df_clean[C.S_PE] == -1.0).sum() > len(df_clean) * 0.9
-    pe_cond = (df_clean[C.S_PE] > c_conf.MIN_PE) | is_fallback
+    is_etf = df_clean[C.S_CODE].astype(str).str.startswith(('51', '15', '588', '56'))
+    pe_cond = (df_clean[C.S_PE] > c_conf.MIN_PE) | is_fallback | is_etf
+    
+    stock_mask = (df_clean[C.S_MCAP].between(c_conf.MIN_CAP, c_conf.MAX_CAP)) & \
+                 (df_clean[C.S_TURN].between(c_conf.MIN_TURNOVER, c_conf.MAX_TURNOVER)) & \
+                 pe_cond & (df_clean[C.S_PE] <= c_conf.MAX_PE) & \
+                 (df_clean[C.S_PB] > 0) & (df_clean[C.S_PB] <= 30.0) & \
+                 (~df_clean[C.S_CODE].astype(str).str.startswith(('688', '8', '4', '9')))
     
     mask = (df_clean[C.S_PCT] >= c_conf.MIN_PCT_CHG) & \
            (df_clean[C.S_PRICE] <= c_conf.MAX_PRICE) & \
-           (df_clean[C.S_MCAP].between(c_conf.MIN_CAP, c_conf.MAX_CAP)) & \
-           (df_clean[C.S_TURN].between(c_conf.MIN_TURNOVER, c_conf.MAX_TURNOVER)) & \
-           pe_cond & (df_clean[C.S_PE] <= c_conf.MAX_PE) & \
-           (df_clean[C.S_PB] > 0) & (df_clean[C.S_PB] <= 30.0) & \
-           (~df_clean[C.S_CODE].str.startswith(('688', '8', '4', '9'))) & \
-           (df_clean[C.S_HIGH] > df_clean[C.S_LOW]) 
+           (df_clean[C.S_HIGH] > df_clean[C.S_LOW]) & \
+           (stock_mask | is_etf)
     
     if C.S_VR in df_clean.columns and not is_fallback:
-        mask &= df_clean[C.S_VR].between(c_conf.MIN_VOL_RATIO, c_conf.MAX_VOL_RATIO)
+        mask &= (df_clean[C.S_VR].between(c_conf.MIN_VOL_RATIO, c_conf.MAX_VOL_RATIO) | is_etf)
 
     recent_pushed_codes = {str(c) for c in df_clean[C.S_CODE] if is_recently_pushed(str(c), pushed)}
     pool = df_clean[mask].pipe(lambda d: d[~d[C.S_CODE].isin(recent_pushed_codes)]).copy()

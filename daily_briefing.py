@@ -19,47 +19,54 @@ class MacroBrain:
     def get_ashare_indices():
         indices_data = {}
         try:
-            df = ak.stock_zh_index_spot_em()
-            if df is not None and not df.empty:
-                log.info(f"A股大盘获取成功，总行数: {len(df)}，包含列: {df.columns.tolist()}")
-                for name_kw, target_name in [("沪深300", "沪深300"), ("创业板指", "创业板指"), ("上证指数", "上证指数")]:
-                    row = df[df["名称"].str.contains(name_kw, na=False)]
-                    if not row.empty:
-                        indices_data[target_name] = {
-                            "pct": float(row.iloc[0]["涨跌幅"]),
-                            "close": float(row.iloc[0]["最新价"])
-                        }
-            else:
-                log.warning("ak.stock_zh_index_spot_em() 返回为空")
+            url = "https://hq.sinajs.cn/list=s_sh000001,s_sz399001,s_sz399006,s_sz399300"
+            headers = {"Referer": "https://finance.sina.com.cn/"}
+            res = requests.get(url, headers=headers, timeout=5)
+            # 返回格式: var hq_str_s_sh000001="上证指数,3055.2013,1.2312,1.23,234123,234123";
+            for line in res.text.strip().split('\n'):
+                if '="' in line:
+                    parts = line.split('="')[1].strip('";').split(',')
+                    if len(parts) >= 4:
+                        name = parts[0]
+                        pct = float(parts[3])
+                        # Normalize names
+                        if name == "沪深300": target_name = "沪深300"
+                        elif name == "创业板指": target_name = "创业板指"
+                        elif name == "上证指数": target_name = "上证指数"
+                        else: target_name = name
+                        
+                        indices_data[target_name] = {"pct": pct}
+            log.info(f"新浪A股大盘获取成功: {indices_data}")
         except Exception as e:
-            log.warning(f"获取A股大盘指数失败: {e}")
+            log.warning(f"获取新浪A股大盘失败: {e}")
         return indices_data
 
     @staticmethod
     def get_global_indices():
         indices_data = {}
-        # 恒生指数
         try:
-            df_hk = ak.stock_hk_spot_em()
-            if df_hk is not None and not df_hk.empty:
-                log.info(f"港股获取成功，总行数: {len(df_hk)}")
-                row = df_hk[df_hk["名称"].str.contains("恒生指数", na=False)]
-                if not row.empty:
-                    indices_data["恒生指数"] = {"pct": float(row.iloc[0]["涨跌幅"])}
+            # int_dji (道琼斯), int_nasdaq (纳斯达克), int_sp500 (标普), b_HSI (恒指)
+            url = "https://hq.sinajs.cn/list=int_dji,int_nasdaq,int_sp500,b_HSI"
+            headers = {"Referer": "https://finance.sina.com.cn/"}
+            res = requests.get(url, headers=headers, timeout=5)
+            # 返回格式: var hq_str_int_nasdaq="纳斯达克,15927.90,1.23,1.5, ..."; 
+            # 港股格式可能不同，按逗号分隔，第4个通常是涨跌幅或第3个。
+            for line in res.text.strip().split('\n'):
+                if '="' in line:
+                    key = line.split('=')[0]
+                    parts = line.split('="')[1].strip('";').split(',')
+                    
+                    if "int_" in key and len(parts) >= 4:
+                        name = parts[0]
+                        pct = float(parts[3])
+                        indices_data[name] = {"pct": pct}
+                    elif "b_HSI" in key and len(parts) >= 6:
+                        # 恒指: "恒生指数,16000.00,15000.00,16500.00,16200.00,200.00,1.25"
+                        # 通常第6或第7是涨跌幅
+                        indices_data["恒生指数"] = {"pct": float(parts[6])}
+            log.info(f"新浪外盘获取成功: {indices_data}")
         except Exception as e:
-            log.warning(f"港股数据失败: {e}")
-
-        # 美股指数
-        try:
-            df_us = ak.stock_us_spot_em()
-            if df_us is not None and not df_us.empty:
-                log.info(f"美股获取成功，总行数: {len(df_us)}")
-                for name_kw, target_name in [("纳斯达克", "纳斯达克"), ("标普500", "标普500"), ("道琼斯", "道琼斯")]:
-                    row = df_us[df_us["名称"].str.contains(name_kw, na=False)]
-                    if not row.empty:
-                        indices_data[target_name] = {"pct": float(row.iloc[0]["涨跌幅"])}
-        except Exception as e:
-            log.warning(f"美股数据失败: {e}")
+            log.warning(f"新浪外盘数据失败: {e}")
             
         return indices_data
 
@@ -69,44 +76,67 @@ class HotStockRadar:
         try:
             log.info("开始拉取 fetch_hot_sectors()")
             hot_stocks = fetch_hot_sectors()
-            log.info(f"fetch_hot_sectors() 返回个股数量: {len(hot_stocks) if hot_stocks else 0}")
-            if not hot_stocks:
-                return []
+            if hot_stocks:
+                log.info(f"fetch_hot_sectors() 返回个股数量: {len(hot_stocks)}")
+                sector_counts = {}
+                for code, sector in hot_stocks.items():
+                    sector_counts[sector] = sector_counts.get(sector, 0) + 1
+                sorted_sectors = sorted(sector_counts.items(), key=lambda x: x[1], reverse=True)
+                return [s[0] for s in sorted_sectors[:limit]]
+            else:
+                log.warning("fetch_hot_sectors() 为空，尝试直接解析新浪行业板块兜底...")
+                url = "https://vip.stock.finance.sina.com.cn/q/view/newSinaHy.php"
+                headers = {"Referer": "https://finance.sina.com.cn/"}
+                res = requests.get(url, headers=headers, timeout=5)
+                # var S_KV = {"new_bljc":"玻璃建材,55,13.23,2.45, ..."}
+                text = res.text.split("=")[1].strip().strip(";")
+                import json
+                data = json.loads(text)
                 
-            sector_counts = {}
-            for code, sector in hot_stocks.items():
-                sector_counts[sector] = sector_counts.get(sector, 0) + 1
-            
-            sorted_sectors = sorted(sector_counts.items(), key=lambda x: x[1], reverse=True)
-            return [s[0] for s in sorted_sectors[:limit]]
+                sectors = []
+                for k, v in data.items():
+                    parts = v.split(',')
+                    if len(parts) >= 4:
+                        name = parts[0]
+                        try:
+                            pct = float(parts[3])
+                            sectors.append((name, pct))
+                        except: pass
+                
+                sectors.sort(key=lambda x: x[1], reverse=True)
+                top_sectors = [s[0] for s in sectors[:limit]]
+                log.info(f"新浪兜底板块提取成功: {top_sectors}")
+                return top_sectors
+
         except Exception as e:
-            log.warning(f"获取热门板块失败: {e}")
+            log.warning(f"获取热门板块全线失败: {e}", exc_info=True)
             return []
 
 class NewsDigest:
     @staticmethod
     def get_news(limit=5):
-        log.info("尝试拉取最新市场新闻...")
+        log.info("尝试拉取新浪 7x24 财经滚播新闻...")
         news_list = []
         try:
-            df = ak.stock_telegraph_cls()
-            if df is not None and not df.empty:
-                log.info(f"财联社电报获取成功，列名: {df.columns.tolist()}，数据行数: {len(df)}")
-                # 兼容旧版本可能只有 'title' 没有 '标题' 的问题
-                col_title = "标题" if "标题" in df.columns else "title"
-                col_time = "发布时间" if "发布时间" in df.columns else "time"
-                
-                if col_title in df.columns and col_time in df.columns:
-                    df = df[df[col_title].astype(str).str.len() > 0]
-                    df = df.head(limit)
-                    for _, row in df.iterrows():
-                        news_list.append(f"【{row[col_time]}】{row[col_title]}")
-                else:
-                    log.warning(f"找不到预期的列名，放弃新闻提取。存在列: {df.columns.tolist()}")
+            # lid=2509 表示A股/财经相关滚播
+            url = "https://feed.mix.sina.com.cn/api/roll/get?pageid=153&lid=2509&k=&num=10&page=1"
+            headers = {"Referer": "https://finance.sina.com.cn/"}
+            res = requests.get(url, headers=headers, timeout=5).json()
+            
+            data = res.get('result', {}).get('data', [])
+            if data:
+                for doc in data[:limit]:
+                    # 时间戳转换
+                    dt = datetime.fromtimestamp(int(doc['ctime']))
+                    time_str = dt.strftime('%H:%M')
+                    title = doc.get('title', '')
+                    if title:
+                        news_list.append(f"【{time_str}】{title}")
+                log.info(f"新浪新闻获取成功，条数: {len(news_list)}")
             else:
-                log.warning("财联社电报接口返回为空")
+                log.warning("新浪新闻接口返回数据为空")
         except Exception as e:
-            log.warning(f"获取新闻兜底失败: {e}")
+            log.warning(f"获取新闻失败: {e}", exc_info=True)
             
         return news_list
 

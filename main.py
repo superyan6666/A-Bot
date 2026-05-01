@@ -1259,7 +1259,8 @@ def vectorized_prescreen(pool: pd.DataFrame, is_fallback: bool = False) -> pd.Se
     s -= np.where(pct > 9.0, 15.0, 0.0)
     
     if is_fallback:
-        s += 20.0
+        # [降级补偿] 兜底模式下由于缺失涨跌幅等特征，给予适当的基础分补偿 (由20降为10，防止过度放宽预筛分门槛)
+        s += 10.0
         
     is_etf = pool.index.astype(str).str.startswith(('51', '15', '588', '56'))
     s += np.where(is_etf, 20.0, 0.0)
@@ -1427,7 +1428,7 @@ def get_signals() -> tuple[list[Signal], list, set, int, str, int]:
         log.error(f"❌ 核心横截面行情获取失败: {e}")
         return [], [], pushed, 0, f"⚠️ **行情接口异常，体检中断**: {e}", 0
 
-    c_conf = config
+    c_conf = Config()
     df_clean, m_ok, m_msg, idx_ret, m_overheated, m_regime, vol_surge = extract_market_context(df_raw, c_conf)
 
     if 'DATA_MODE' in df_raw.columns and (df_raw['DATA_MODE'] == 'T+1_FALLBACK').any():

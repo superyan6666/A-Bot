@@ -846,15 +846,26 @@ class LocalDataLake:
         if self._offline_summary_printed: return
         self._offline_summary_printed = True
         log.warning(f"📴 [OFFLINE_MODE] 已开启无网络强制缓存模式！")
-        log.warning(f"📴 [OFFLINE_MODE] 超过 {OFFLINE_MAX_AGE_DAYS} 天的缓存将被拒绝。若需强制刷新请删除 hist_cache 目录。")
+        log.warning(f"📴 [OFFLINE_MODE] 超过 {config.OFFLINE_MAX_AGE_DAYS} 天的缓存将被拒绝。若需强制刷新请删除 hist_cache 目录。")
         files = glob.glob(os.path.join(self.cache_dir, "*.pkl"))
         if not files:
             log.warning("📴 [OFFLINE_MODE] 警告：本地无任何缓存文件！后续请求可能抛出异常。")
             return
         log.warning("📴 [OFFLINE_MODE] 本地缓存资产库摘要:")
         for f in sorted(files, key=os.path.getmtime, reverse=True)[:10]:
-            mtime = datetime.fromtimestamp(os.path.getmtime(f)).strftime('%Y-%m-%d %H:%M:%S')
-            log.warning(f"  - {os.path.basename(f)} (生成时间: {mtime})")
+            mtime = os.path.getmtime(f)
+            time_src = "文件系统"
+            try:
+                with open(f, 'rb') as pf:
+                    payload = pickle.load(pf)
+                if isinstance(payload, dict) and 'created_at' in payload:
+                    mtime = payload['created_at']
+                    time_src = "内部烙印"
+            except Exception:
+                pass
+            
+            time_str = datetime.fromtimestamp(mtime).strftime('%Y-%m-%d %H:%M:%S')
+            log.warning(f"  - {os.path.basename(f)} ({time_src}时间: {time_str})")
         if len(files) > 10: log.warning(f"  ...及其他 {len(files)-10} 个缓存文件。")
 
     def _get_cache(self, key: str, ttl_seconds: int):
@@ -866,11 +877,13 @@ class LocalDataLake:
                 payload = pickle.load(f)
             
             # 兼容旧版本格式 (直接保存的 DataFrame)
+            time_src = "内部烙印"
             if isinstance(payload, dict) and 'created_at' in payload and 'data' in payload:
                 mtime = payload['created_at']
                 data = payload['data']
             else:
                 mtime = os.path.getmtime(filename)
+                time_src = "文件系统"
                 data = payload
 
             age_seconds = time.time() - mtime
@@ -878,8 +891,8 @@ class LocalDataLake:
 
             if config.DATA_CACHE_MODE == 'offline':
                 self._print_offline_summary()
-                if age_days > OFFLINE_MAX_AGE_DAYS:
-                    log.warning(f"⚠️ [CACHE_REJECT] {key} 最新离线缓存已超过 {OFFLINE_MAX_AGE_DAYS} 天，拒绝使用。")
+                if age_days > config.OFFLINE_MAX_AGE_DAYS:
+                    log.warning(f"⚠️ [CACHE_REJECT] {key} 最新离线缓存 ({time_src}) 已超过 {config.OFFLINE_MAX_AGE_DAYS} 天，拒绝使用。")
                     return None
                 return data
                 

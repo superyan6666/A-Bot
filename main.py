@@ -1448,7 +1448,8 @@ def get_signals() -> tuple[list[Signal], list, set, int, str, int]:
         df_clean = df_clean[df_clean[C.S_CODE].isin(core_pool)]
         log.info(f"💎 已开启【核心优质股池】模式，限定扫描 {len(core_pool)} 只国家队核心及高弹性成分股。")
 
-    is_fallback = (df_clean[C.S_PE] == -1.0).sum() > len(df_clean) * 0.9
+    is_t1_fallback = 'DATA_MODE' in df_raw.columns and (df_raw['DATA_MODE'] == 'T+1_FALLBACK').any()
+    is_fallback = ((df_clean[C.S_PE] == -1.0).sum() > len(df_clean) * 0.9) or is_t1_fallback
     is_etf = df_clean[C.S_CODE].astype(str).str.startswith(('51', '15', '588', '56'))
     pe_cond = (df_clean[C.S_PE] > c_conf.MIN_PE) | is_fallback | is_etf
     

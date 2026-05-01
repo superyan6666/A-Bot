@@ -202,8 +202,11 @@ def load_and_update_paper_trades(df_spot: pd.DataFrame) -> tuple[list, dict]:
         buy_date = datetime.strptime(t['date'], '%Y-%m-%d').date()
         days_since_buy = (today_date - buy_date).days
         
-        # 丢弃超过 90 天的历史记录，避免文件膨胀
+        # 丢弃超过 90 天的已完结历史记录，避免文件膨胀
         if days_since_buy > 90 and status != 'PENDING':
+            continue
+        # [防爆雷] PENDING 状态长期未触发可能存在停牌等异常，超过 120 天强制过期丢弃
+        if days_since_buy > 120 and status == 'PENDING':
             continue
         
         if status == 'PENDING' and code in spot_dict:
@@ -1639,15 +1642,14 @@ def send_dingtalk(signals: list[Signal], watchlist: list, total_pool: int, total
                 tdx_market = 'SH' if str(s.code).startswith('6') else 'SZ' 
                 
                 sina_market = 'sh' if str(s.code).startswith('6') else 'sz'
-                kline_url = f"http://image.sinajs.cn/newchart/weekly/n/{sina_market}{s.code}.gif"
+                code_str = str(s.code)
                 
-                # 预检周线图 URL 是否有效，避免钉钉展示大面积图裂 (北交所、部分科创板无图)
-                try:
-                    r_check = requests.head(kline_url, timeout=2)
-                    if r_check.status_code != 200:
-                        kline_url = "https://dummyimage.com/800x400/f3f4f6/9ca3af.png&text=No+Chart+Available"
-                except Exception:
+                # [性能优化] 彻底消除同步网络检测 (requests.head) 带来的延迟雪崩
+                # 根据号段硬编码直接拦截无法生成周线图的边缘板块
+                if code_str.startswith(('8', '4', '9', '688')):
                     kline_url = "https://dummyimage.com/800x400/f3f4f6/9ca3af.png&text=No+Chart+Available"
+                else:
+                    kline_url = f"http://image.sinajs.cn/newchart/weekly/n/{sina_market}{s.code}.gif"
                 
                 parts.append(
                     f"#### 🎯 {s.name} (`{s.code}`)\n"
@@ -1713,12 +1715,20 @@ def send_dingtalk(signals: list[Signal], watchlist: list, total_pool: int, total
         else:
             log.warning(f"⚠️ 推送消息长度({len(content)})突破限制，启动分片推送机制...")
             chunks = [content[i:i+CHUNK_SIZE] for i in range(0, len(content), CHUNK_SIZE)]
+            
+            # [流控防线] 钉钉限制单机器人 20条/分，极端情况下拦截无休止分片
+            if len(chunks) > 3:
+                log.warning(f"⚠️ 预警内容极长 (片段数: {len(chunks)})，强行截断至前 3 篇以防流控！")
+                chunks = chunks[:3]
+                chunks[-1] += "\n\n> ⚠️ *(本文因超出钉钉承载极限，尾部数据已被系统强制截断)*"
+                
             for idx, chunk in enumerate(chunks):
+                text = chunk if idx == 0 else f"_(续上条)_\n\n{chunk}"
                 payload = {
                     'msgtype': 'markdown',
                     'markdown': {
                         'title': f'🤖 AI量化提醒 (Part {idx+1}/{len(chunks)})',
-                        'text': chunk
+                        'text': text
                     }
                 }
                 res = requests.post(webhook, json=payload, timeout=10)

@@ -13,8 +13,15 @@ def get_factors_config(f_val: float, f_mom: float, f_rev: float, f_risk: float,
                        tw: float, rw: float, m_regime: str, 
                        in_danger: bool, danger_label: str) -> list[Factor]:
     """
-    数据驱动的因子引擎配置。
-    投研人员可在此处增删改查因子规则，核心引擎会自动加载并执行。
+    数据驱动的因子引擎配置表。
+    
+    【动态权重参数说明】
+    - f_val (Value): 价值因子权重乘数。在熊市(BEAR)中放大，优先考虑低市盈率/破净股的安全边际。
+    - f_mom (Momentum): 动量因子权重乘数。在牛市(BULL)中放大，追随资金热度和强势突破。
+    - f_rev (Reversal): 反转因子权重乘数。在冰点期(PANIC)中放大，捕捉恐慌盘杀跌后的超跌反弹。
+    - f_risk (Risk): 风险惩罚乘数。在熊市和冰点期显著放大，严厉惩罚短期暴涨、均线破位等高危形态。
+    - tw (Trend Weight): 趋势乘数。当 ADX > 25 (主升浪) 时被激活放大。
+    - rw (Reversal Weight): 震荡反转乘数。当 ADX < 15 (震荡蓄势) 时被激活放大。
     """
     return [
         Factor(lambda d: d.get('macd_divergence', False), 25, 1.0, "- 🧲 **MACD底背离**：日线级别价格创新低但动能衰竭，极其罕见的左侧黄金坑 (触发强加权)"),

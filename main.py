@@ -16,32 +16,7 @@ import pytz
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
 
 from factors_config import Factor, get_factors_config
-from urllib.parse import urlparse
-
-# 全局网络防拦截伪装 (Global WAF Bypass)
-# 强制为指定行情接口的 requests 请求注入现代浏览器的 User-Agent，防止被东方财富/新浪识别为云端爬虫直接掐断连接
-_original_request = requests.Session.request
-
-def _patched_request(self, method, url, **kwargs):
-    parsed = urlparse(url)
-    hostname = parsed.hostname or ""
-    
-    # 仅针对常见行情域名的白名单进行 UA 伪装，避免污染钉钉等原生请求
-    whitelist_domains = ('eastmoney.com', 'sina.com.cn', 'sinajs.cn', '163.com', 'tushare.pro')
-    needs_patch = any(hostname.endswith(d) for d in whitelist_domains)
-    
-    if needs_patch:
-        headers = kwargs.get('headers', {})
-        if not isinstance(headers, dict):
-            headers = dict(headers)
-        if 'User-Agent' not in headers and 'user-agent' not in headers:
-            headers['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
-        kwargs['headers'] = headers
-        
-    kwargs['timeout'] = kwargs.get('timeout', 15.0)
-    return _original_request(self, method, url, **kwargs)
-
-requests.Session.request = _patched_request
+# 导入区域结束
 
 # ═════════════════════════════════════════════════════════════════════════════
 # 1. 环境与核心配置 (Environment & Config)
@@ -76,6 +51,26 @@ class AppConfig:
             return default
         return self._env[key]
 
+    def print_summary(self, logger: logging.Logger):
+        safe_env = {}
+        for k, v in self._env.items():
+            if 'TOKEN' in k.upper() or 'WEBHOOK' in k.upper() or 'SECRET' in k.upper():
+                val_str = str(v)
+                safe_env[k] = f"{val_str[:4]}...{val_str[-4:]}" if len(val_str) > 8 else "***"
+            else:
+                safe_env[k] = v
+                
+        summary = (
+            f"🔧 核心配置已加载:\n"
+            f"  - RUN_MODE: {self.RUN_MODE}\n"
+            f"  - DATA_CACHE_MODE: {self.DATA_CACHE_MODE}\n"
+            f"  - OFFLINE_MAX_AGE_DAYS: {self.OFFLINE_MAX_AGE_DAYS}\n"
+            f"  - LOG_LEVEL: {self.LOG_LEVEL}\n"
+            f"  - IS_MANUAL: {self.IS_MANUAL}\n"
+            f"  - PUSH_EMPTY: {self.PUSH_EMPTY}"
+        )
+        logger.info(summary)
+
 config = AppConfig()
 
 TZ_BJS       = pytz.timezone('Asia/Shanghai')
@@ -95,6 +90,34 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S',
 )
 log = logging.getLogger(__name__)
+
+# 全局网络防拦截伪装 (Global WAF Bypass)
+# 强制为指定行情接口的 requests 请求注入现代浏览器的 User-Agent，防止被东方财富/新浪识别为云端爬虫直接掐断连接
+_original_request = requests.Session.request
+
+def _patched_request(self, method, url, **kwargs):
+    parsed = urlparse(url)
+    hostname = parsed.hostname or ""
+    
+    # 仅针对常见行情域名的白名单进行 UA 伪装，避免污染钉钉等原生请求
+    whitelist_domains = ('eastmoney.com', 'sina.com.cn', 'sinajs.cn', '163.com', 'tushare.pro')
+    needs_patch = any(hostname.endswith(d) for d in whitelist_domains)
+    
+    if needs_patch:
+        log.debug(f"[WAF Patch] 注入浏览器 UA -> {hostname}")
+        headers = kwargs.get('headers', {})
+        if not isinstance(headers, dict):
+            headers = dict(headers)
+        if 'User-Agent' not in headers and 'user-agent' not in headers:
+            headers['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+        kwargs['headers'] = headers
+    else:
+        log.debug(f"[WAF Patch] 原生放行 -> {hostname}")
+        
+    kwargs['timeout'] = kwargs.get('timeout', 15.0)
+    return _original_request(self, method, url, **kwargs)
+
+requests.Session.request = _patched_request
 
 if not os.path.exists(HIST_CACHE_DIR):
     os.makedirs(HIST_CACHE_DIR, exist_ok=True)
@@ -1695,9 +1718,16 @@ def send_dingtalk(signals: list[Signal], watchlist: list, total_pool: int, total
 
 if __name__ == '__main__':
     try:
-        sigs, watch, pushed, pool_size, m_msg, total_mkt = get_signals()
-        send_dingtalk(sigs, watch, pool_size, total_mkt, m_msg)
-        if sigs: save_pushed_state(pushed)
+        config.print_summary(log)
+        
+        # Check required webhook before running heavy pipeline
+        if not config.DINGTALK_WEBHOOK:
+            log.error("未配置 DINGTALK_WEBHOOK，跳过执行。")
+        else:
+            sigs, watch, pushed, pool_size, m_msg, total_mkt = get_signals()
+            send_dingtalk(sigs, watch, pool_size, total_mkt, m_msg)
+            if sigs: save_pushed_state(pushed)
+            
     except Exception as e:
         log.critical(f"系统崩溃: {e}", exc_info=True)
         webhook_url = os.environ.get('DINGTALK_WEBHOOK')

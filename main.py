@@ -15,17 +15,29 @@ import pandas as pd
 import pytz
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
 
+from factors_config import Factor, get_factors_config
+from urllib.parse import urlparse
+
 # 全局网络防拦截伪装 (Global WAF Bypass)
-# 强制为所有底层的 requests 请求注入现代浏览器的 User-Agent，防止被东方财富/新浪识别为云端爬虫直接掐断连接
+# 强制为指定行情接口的 requests 请求注入现代浏览器的 User-Agent，防止被东方财富/新浪识别为云端爬虫直接掐断连接
 _original_request = requests.Session.request
 
 def _patched_request(self, method, url, **kwargs):
-    headers = kwargs.get('headers', {})
-    if not isinstance(headers, dict):
-        headers = dict(headers)
-    if 'User-Agent' not in headers and 'user-agent' not in headers:
-        headers['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
-    kwargs['headers'] = headers
+    parsed = urlparse(url)
+    hostname = parsed.hostname or ""
+    
+    # 仅针对常见行情域名的白名单进行 UA 伪装，避免污染钉钉等原生请求
+    whitelist_domains = ('eastmoney.com', 'sina.com.cn', 'sinajs.cn', '163.com', 'tushare.pro')
+    needs_patch = any(hostname.endswith(d) for d in whitelist_domains)
+    
+    if needs_patch:
+        headers = kwargs.get('headers', {})
+        if not isinstance(headers, dict):
+            headers = dict(headers)
+        if 'User-Agent' not in headers and 'user-agent' not in headers:
+            headers['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+        kwargs['headers'] = headers
+        
     kwargs['timeout'] = kwargs.get('timeout', 15.0)
     return _original_request(self, method, url, **kwargs)
 
@@ -34,18 +46,51 @@ requests.Session.request = _patched_request
 # ═════════════════════════════════════════════════════════════════════════════
 # 1. 环境与核心配置 (Environment & Config)
 # ═════════════════════════════════════════════════════════════════════════════
+class AppConfig:
+    _instance = None
+    
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super(AppConfig, cls).__new__(cls)
+            cls._instance._init_env()
+        return cls._instance
+        
+    def _init_env(self):
+        self._env = dict(os.environ)
+        
+        # 预定义核心配置
+        self.IS_MANUAL = self.get('GITHUB_EVENT_NAME') == 'workflow_dispatch'
+        self.PUSH_EMPTY = self.get('PUSH_EMPTY_RESULT', 'true').lower() in ('true', '1', 'yes')
+        self.LOG_LEVEL = self.get('LOG_LEVEL', 'INFO').upper()
+        self.DATA_CACHE_MODE = self.get('DATA_CACHE_MODE', 'online').lower()
+        self.OFFLINE_MAX_AGE_DAYS = int(self.get('OFFLINE_MAX_AGE_DAYS', 7))
+        self.TUSHARE_TOKEN = self.get('TUSHARE_TOKEN', '').strip()
+        self.DINGTALK_WEBHOOK = self.get('DINGTALK_WEBHOOK', '')
+        self.RUN_MODE = self.get('RUN_MODE', 'normal')
+        
+    def get(self, key: str, default: any = None) -> any:
+        if key not in self._env:
+            if default is not None:
+                # 在 config 初始化阶段 logger 可能尚未 setup，暂时 print 或者等后续再 log
+                print(f"⚠️ [Config] 环境变量缺失 '{key}'，将使用默认值: {default}")
+            return default
+        return self._env[key]
+
+config = AppConfig()
+
 TZ_BJS       = pytz.timezone('Asia/Shanghai')
 STATE_FILE   = 'pushed_state.json'
 SPOT_CACHE   = 'spot_cache.pkl'
 HIST_CACHE_DIR = 'hist_cache'
 PAPER_TRADES_FILE = 'paper_trades.json' 
-IS_MANUAL    = os.environ.get('GITHUB_EVENT_NAME') == 'workflow_dispatch'
-PUSH_EMPTY   = os.environ.get('PUSH_EMPTY_RESULT', 'true').lower() in ('true', '1', 'yes')
+
+IS_MANUAL    = config.IS_MANUAL
+PUSH_EMPTY   = config.PUSH_EMPTY
 
 socket.setdefaulttimeout(15.0)
 
 logging.basicConfig(
-    level=getattr(logging, os.environ.get('LOG_LEVEL', 'INFO').upper(), logging.INFO),
+    level=getattr(logging, config.LOG_LEVEL, logging.INFO),
     format='%(asctime)s - %(levelname)s - %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S',
 )
@@ -407,7 +452,6 @@ try:
 except ImportError:
     ef = None
 
-DATA_CACHE_MODE = os.environ.get('DATA_CACHE_MODE', 'online').lower()
 OFFLINE_MAX_AGE_DAYS = int(os.environ.get('OFFLINE_MAX_AGE_DAYS', 7))
 
 def retry(times=4, delay=2, exceptions=(Exception,)):
@@ -431,7 +475,7 @@ class DataProxy:
     def __init__(self):
         self.bs_logged_in = False
         self.ts_pro = None
-        ts_token = os.environ.get('TUSHARE_TOKEN', '').strip()
+        ts_token = config.TUSHARE_TOKEN
         if ts_token:
             try:
                 import tushare as ts
@@ -809,7 +853,7 @@ class LocalDataLake:
             age_seconds = time.time() - mtime
             age_days = age_seconds / 86400.0
 
-            if DATA_CACHE_MODE == 'offline':
+            if config.DATA_CACHE_MODE == 'offline':
                 self._print_offline_summary()
                 if age_days > OFFLINE_MAX_AGE_DAYS:
                     log.warning(f"⚠️ [CACHE_REJECT] {key} 最新离线缓存已超过 {OFFLINE_MAX_AGE_DAYS} 天，拒绝使用。")
@@ -852,7 +896,7 @@ class LocalDataLake:
         ttl = 3600 if now.hour >= 15 and now.minute >= 30 else 300 # 盘后延长TTL避免无意义请求
         cached = self._get_cache("spot", ttl)
         if cached is not None:
-            if DATA_CACHE_MODE != 'offline': log.info(f"📦 命中 spot 本地实时缓存(当前时效 {ttl} 秒)...")
+            if config.DATA_CACHE_MODE != 'offline': log.info(f"📦 命中 spot 本地实时缓存(当前时效 {ttl} 秒)...")
             return cached
         df = self.proxy.get_spot()
         self._set_cache("spot", df)
@@ -1057,14 +1101,6 @@ class AShareTechnicals:
 # ═════════════════════════════════════════════════════════════════════════════
 # 8. 打分与自适应演化引擎 (Scoring & Evolution Engine)
 # ═════════════════════════════════════════════════════════════════════════════
-@dataclass
-class Factor:
-    condition: Callable[[dict], bool]
-    points: int
-    weight: float = 1.0
-    template: str = ""
-    group: str = ""
-
 def apply_scoring(data: dict, now: datetime, m_regime: str, vol_surge: bool, win_stats: dict, is_fallback: bool = False) -> tuple[int, str, str]:
     adx = data['adx']
     tw, rw = (1.4, 0.7) if adx > 25 else (0.8, 1.4) if adx < 15 else (1.0, 1.0)
@@ -1094,57 +1130,7 @@ def apply_scoring(data: dict, now: datetime, m_regime: str, vol_surge: bool, win
 
     in_danger, danger_label = is_earnings_danger_zone(now)
 
-    factors = [
-        Factor(lambda d: d.get('macd_divergence', False), 25, 1.0, "- 🧲 **MACD底背离**：日线级别价格创新低但动能衰竭，极其罕见的左侧黄金坑 (触发强加权)"),
-        Factor(lambda d: d['mcap'] > 300e8 and 0 < d['pe'] < 25 and d['pb'] < 3, 10, f_val, "- 🏢 **价值蓝筹**：大市值低估值核心资产，防守属性极强", "VAL"),
-        Factor(lambda d: d['vol_ratio'] > 1.0 and d['rs_rating'] > 5, 10, f_mom, "- 🚀 **强势领涨**：近期显著强于大盘，资金接力意愿极强", "MOM"),
-        Factor(lambda d: d['price_pct'] < 0.3 and 0 < d['pb'] < 1.0, 8, f_val, "- ♻️ **困境反转**：股价严重破净且处于绝对低位，安全垫极厚", "VAL"),
-        
-        Factor(lambda d: d.get('in_hot_sector', False), 12, f_mom, "- 🌡️ **身处主线**：所在板块【{hot_sector_name}】今日强势领涨，踏准市场节奏"),
-        
-        Factor(lambda d: d['price_pct'] < 0.25, 12, f_rev * rw, "- 🟢 **绝对低位**：目前买入相当于抄底，长线持有安全", "POS"),
-        Factor(lambda d: 0.25 <= d['price_pct'] <= 0.45, 8, f_rev, "- 🟢 **相对低位**：刚刚从底部爬起来，输时间不输钱", "POS"),
-        Factor(lambda d: d['price_pct'] > 0.45, 6, f_mom, "- 📈 **多头趋势**：股价已脱离底部，处于健康的主升浪区间", "POS"),
-        Factor(lambda d: d['price_pct'] > 0.85, 8, f_mom, "- 🚀 **高位突破**：股价处于年度高位，强者恒强趋势极佳", "MOM"), 
-        
-        Factor(lambda d: d['pe'] > 0 and d['pe'] < 40, 5, f_val, "- 🛡️ **业绩护体**：市盈率健康，不是炒空气的无基本面股", "VAL"),
-        Factor(lambda d: d['macd_dea'] >= -0.05, 5, 1.0, "- 🌊 **多头控盘**：大周期趋势仍强，没有被深套的风险"), 
-        
-        Factor(lambda d: -2.0 <= d['dist_ma20'] <= 6.0, 12, 1.0, "- 🧲 **贴地潜伏**：目前价格紧贴均线支撑，绝佳安全低吸点", "MA20"),
-        Factor(lambda d: 6.0 < d['dist_ma20'] <= 15.0, 6, f_mom, "- 🚀 **强势发力**：距离20日线有空间，依托短期均线强势上攻", "MA20"),
-        Factor(lambda d: d['dist_ma20'] < -2.0, -10, f_risk, "- ⚠️ **破位嫌疑**：当前已跌破20日线，需警惕趋势走坏 (扣分)"),
-        
-        Factor(lambda d: 30 <= d.get('rsi', 50) <= 72, 5, 1.0, "- 📊 **温度适中**：RSI处于健康买入区间，正是下手时机"),
-        
-        Factor(lambda d: d['bull_rank'], 8, f_mom, "- 📈 **顺势而为**：均线多头排列，跟着主力资金大部队走"),
-        
-        Factor(lambda d: d['has_zt'], 8, 1.0, "- 🔥 **股性活跃**：该股历史上容易涨停，不会一潭死水"),
-        Factor(lambda d: d['vol_ratio'] >= 1.8, 8, 1.0, "- 🔵 **放量确认**：今天成交量明显放大，大资金开始干活了", "VOL"),
-        Factor(lambda d: d['red_days'] >= 2, 5, 1.0, "- 🔴 **稳步推升**：最近重心都在上移，主力在偷偷温和建仓"),
-        
-        Factor(lambda d: d['has_chip_break'], 12, tw * f_mom, "- 🏔️ **抛压真空**：上方的套牢盘已割肉离场，向上拉升没阻力", "VCP"),
-        Factor(lambda d: d.get('is_true_vcp', False), 12, 1.0, "- 🎯 **形态确认**：呈现经典 VCP (波动率收敛) 结构，洗盘极度充分", "VCP"),
-        Factor(lambda d: not d.get('is_true_vcp', False) and d['vcp_amp'] < 0.12, 6, 1.0, "- 🟣 **蓄势待发**：近期波动极小，面临短线方向选择", "VCP"),
-        Factor(lambda d: d['extreme_shrink_vol'], 8, 1.0, "- 🧊 **没人砸盘**：爆发前夕成交极度萎缩，散户该卖的都卖了", "VCP"), 
-        Factor(lambda d: d['has_obv_break'], 10, tw * f_mom, "- 💸 **真金白银**：模型监控到真实的资金在创纪录净流入", "VOL"),
-        Factor(lambda d: d['has_pullback'], 12, 1.0, "- 🪃 **黄金深坑**：出现温和缩量回踩，主力洗盘给出的上车良机", "VCP"),
-        Factor(lambda d: d['lower_shadow_ratio'] > 0.03, 5, 1.0, "- 📌 **强力护盘**：跌下去被大资金迅速买回，下方有人兜底", "VCP"), 
-        
-        Factor(lambda d: d.get('rs_rating', 0) > 5,  8, f_mom, "- 🏆 **跑赢大盘**：近60日涨幅超越指数，有资金在持续运作"),
-        
-        # --- 【排雷扣分项】 ---
-        Factor(lambda d: d.get('surge_5d', 0) > 28, -20, f_risk, "- 🚫 **短期暴涨**：近5日涨幅过大透支空间，极易高位站岗 (重度扣分)"),
-        Factor(lambda d: d.get('consecutive_down', 0) >= 4, -15, f_risk, "- 🔪 **飞刀预警**：近期连续阴线急跌，左侧接飞刀风险大 (重度扣分)"),
-        Factor(lambda d: d.get('rsi', 50) > 80, -10, f_risk, "- 🌡️ **短期过热**：RSI偏高短线超买，操作需要进一步缩减仓位"),
-        Factor(lambda d: d.get('rs_rating', 0) < -10, -8, f_risk, "- 📉 **跑输大盘**：近期持续弱于大盘，跟的是被冷落的股票"),
-        Factor(lambda d: d['has_consecutive_zt'] and d['price_pct'] < 0.40, 10, f_mom, "- 🔥 **低位连板**：刚刚启动的龙头，安全且市场辨识度极高", "MOM"),
-        Factor(lambda d: d['has_consecutive_zt'] and d['price_pct'] >= 0.90 and not (d.get('is_first_dip', False) and m_regime != 'BEAR'), -15, f_risk, "- ⚠️ **高位接盘**：股价已被炒高连板，千万别追容易接盘！"),
-        Factor(lambda d: d.get('is_first_dip', False) and m_regime != 'BEAR', 20, f_mom, "- 🐉 **龙头首阴**：连板龙头首次缩量温和回调，量价健康且未破5日线，游资经典接力点！"),
-        Factor(lambda d: d['upper_shadow_pct'] > 35, -15, f_risk, "- ⚠️ **诱多预警**：冲高后大幅跳水，上方抛压极重别上当！"),
-        Factor(lambda d: d['dist_ma20'] > 25, -15, f_risk, "- 🚫 **追高预警**：目前涨得太急离均线太远，随时面临暴跌回调"),
-        
-        Factor(lambda d: in_danger and d['mcap'] < 100e8, -8, f_risk, f"- 📅 **财报防雷**：当前属于{danger_label}，小盘股需防业绩变脸 (扣分)")
-    ]
+    factors = get_factors_config(f_val, f_mom, f_rev, f_risk, tw, rw, m_regime, in_danger, danger_label)
 
     group_scores = {}
     group_reasons = {}
@@ -1392,7 +1378,6 @@ def extract_market_context(df_raw: pd.DataFrame, c_conf: Config) -> tuple[pd.Dat
 
 def get_signals() -> tuple[list[Signal], list, set, int, str, int]:
     now = datetime.now(TZ_BJS)
-    run_mode = os.environ.get('RUN_MODE', 'normal')
     
     log.info('🚀 防呆长线安全级·盘后复盘引擎启动...')
     if not IS_MANUAL and not is_valid_run_time(now): 
@@ -1406,13 +1391,13 @@ def get_signals() -> tuple[list[Signal], list, set, int, str, int]:
         log.error(f"❌ 核心横截面行情获取失败: {e}")
         return [], [], pushed, 0, f"⚠️ **行情接口异常，体检中断**: {e}", 0
 
-    c_conf = Config()
+    c_conf = config
     df_clean, m_ok, m_msg, idx_ret, m_overheated, m_regime, vol_surge = extract_market_context(df_raw, c_conf)
 
     if 'DATA_MODE' in df_raw.columns and (df_raw['DATA_MODE'] == 'T+1_FALLBACK').any():
         m_msg += "\n\n> 🚨 **严重警告**：今日所有实时行情流中断，当前所有技术信号均基于【昨日 T-1 收盘截面】生成，严禁用于今日盘中实盘交易！\n\n"
 
-    if run_mode == 'market_only':
+    if c_conf.RUN_MODE == 'market_only':
         log.info("🤖 [大盘体检模式] 完毕，退出个股运算。")
         return [], [], pushed, 0, m_msg, len(df_raw)
 
@@ -1555,14 +1540,14 @@ def get_signals() -> tuple[list[Signal], list, set, int, str, int]:
 # 10. 钉钉网关与推送 (Webhook & Notification)
 # ═════════════════════════════════════════════════════════════════════════════
 def send_dingtalk(signals: list[Signal], watchlist: list, total_pool: int, total_market: int, market_msg: str) -> None:
-    webhook = os.environ.get('DINGTALK_WEBHOOK')
+    webhook = config.DINGTALK_WEBHOOK
     if not webhook:
         log.error("❌ 未配置 DINGTALK_WEBHOOK 环境变量，取消推送！")
         return
     
     now_ts = datetime.now(TZ_BJS)
     now_str = now_ts.strftime('%Y-%m-%d %H:%M')
-    run_mode = os.environ.get('RUN_MODE', 'normal')
+    run_mode = config.RUN_MODE
     
     header = (
         f"## 🤖 AI量化保姆级盘后总结\n"

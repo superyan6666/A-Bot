@@ -1618,6 +1618,14 @@ def send_dingtalk(signals: list[Signal], watchlist: list, total_pool: int, total
                 sina_market = 'sh' if str(s.code).startswith('6') else 'sz'
                 kline_url = f"http://image.sinajs.cn/newchart/weekly/n/{sina_market}{s.code}.gif"
                 
+                # 预检周线图 URL 是否有效，避免钉钉展示大面积图裂 (北交所、部分科创板无图)
+                try:
+                    r_check = requests.head(kline_url, timeout=2)
+                    if r_check.status_code != 200:
+                        kline_url = "https://dummyimage.com/800x400/f3f4f6/9ca3af.png&text=No+Chart+Available"
+                except Exception:
+                    kline_url = "https://dummyimage.com/800x400/f3f4f6/9ca3af.png&text=No+Chart+Available"
+                
                 parts.append(
                     f"#### 🎯 {s.name} (`{s.code}`)\n"
                     f"{warn_msg}"
@@ -1663,20 +1671,39 @@ def send_dingtalk(signals: list[Signal], watchlist: list, total_pool: int, total
         )
 
     try:
-        payload = {
-            'msgtype': 'markdown',
-            'markdown': {
-                'title': '🤖 AI量化盘后提醒',
-                'text': content
+        CHUNK_SIZE = 18000
+        if len(content) <= CHUNK_SIZE:
+            payload = {
+                'msgtype': 'markdown',
+                'markdown': {
+                    'title': '🤖 AI量化盘后提醒',
+                    'text': content
+                }
             }
-        }
-        res = requests.post(webhook, json=payload, timeout=10)
-        res_dict = res.json()
-        
-        if res_dict.get('errcode', 0) != 0:
-            log.error(f"❌ 钉钉接口拒绝推送，请检查「自定义关键词」是否匹配！返回信息: {res_dict}")
+            res = requests.post(webhook, json=payload, timeout=10)
+            res_dict = res.json()
+            
+            if res_dict.get('errcode', 0) != 0:
+                log.error(f"❌ 钉钉接口拒绝推送，请检查「自定义关键词」是否匹配！返回信息: {res_dict}")
+            else:
+                log.info(f"✅ 推送成功 ({len(signals)}正式 / {len(watchlist)}观察)")
         else:
-            log.info(f"✅ 推送成功 ({len(signals)}正式 / {len(watchlist)}观察)")
+            log.warning(f"⚠️ 推送消息长度({len(content)})突破限制，启动分片推送机制...")
+            chunks = [content[i:i+CHUNK_SIZE] for i in range(0, len(content), CHUNK_SIZE)]
+            for idx, chunk in enumerate(chunks):
+                payload = {
+                    'msgtype': 'markdown',
+                    'markdown': {
+                        'title': f'🤖 AI量化提醒 (Part {idx+1}/{len(chunks)})',
+                        'text': chunk
+                    }
+                }
+                res = requests.post(webhook, json=payload, timeout=10)
+                if res.json().get('errcode', 0) != 0:
+                    log.error(f"❌ 分片 {idx+1} 推送被拒: {res.json()}")
+                else:
+                    log.info(f"✅ 分片 {idx+1}/{len(chunks)} 推送成功")
+                time.sleep(1) # 避免触发钉钉流控
             
     except Exception as e:
         log.error(f"❌ 推送网络请求失败: {e}")

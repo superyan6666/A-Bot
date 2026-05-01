@@ -408,7 +408,7 @@ except ImportError:
     ef = None
 
 DATA_CACHE_MODE = os.environ.get('DATA_CACHE_MODE', 'online').lower()
-OFFLINE_MAX_AGE_DAYS = int(os.environ.get('OFFLINE_MAX_AGE_DAYS', 30))
+OFFLINE_MAX_AGE_DAYS = int(os.environ.get('OFFLINE_MAX_AGE_DAYS', 7))
 
 def retry(times=4, delay=2, exceptions=(Exception,)):
     def decorator(fn):
@@ -791,27 +791,36 @@ class LocalDataLake:
         if len(files) > 10: log.warning(f"  ...及其他 {len(files)-10} 个缓存文件。")
 
     def _get_cache(self, key: str, ttl_seconds: int):
-        pattern = os.path.join(self.cache_dir, f"{key}_*.pkl")
-        files = glob.glob(pattern)
-        if not files: return None
+        filename = os.path.join(self.cache_dir, f"{key}.pkl")
+        if not os.path.exists(filename): return None
         
-        files.sort(key=os.path.getmtime, reverse=True)
-        latest_file = files[0]
-        mtime = os.path.getmtime(latest_file)
-        age_seconds = time.time() - mtime
-        age_days = age_seconds / 86400.0
-
-        if DATA_CACHE_MODE == 'offline':
-            self._print_offline_summary()
-            if age_days > OFFLINE_MAX_AGE_DAYS:
-                log.warning(f"⚠️ [CACHE_REJECT] {key} 最新离线缓存已超过 {OFFLINE_MAX_AGE_DAYS} 天，拒绝使用。")
-                return None
-            try: return pd.read_pickle(latest_file)
-            except Exception: return None
+        try:
+            with open(filename, 'rb') as f:
+                payload = pickle.load(f)
             
-        if age_seconds < ttl_seconds:
-            try: return pd.read_pickle(latest_file)
-            except Exception: pass
+            # 兼容旧版本格式 (直接保存的 DataFrame)
+            if isinstance(payload, dict) and 'created_at' in payload and 'data' in payload:
+                mtime = payload['created_at']
+                data = payload['data']
+            else:
+                mtime = os.path.getmtime(filename)
+                data = payload
+
+            age_seconds = time.time() - mtime
+            age_days = age_seconds / 86400.0
+
+            if DATA_CACHE_MODE == 'offline':
+                self._print_offline_summary()
+                if age_days > OFFLINE_MAX_AGE_DAYS:
+                    log.warning(f"⚠️ [CACHE_REJECT] {key} 最新离线缓存已超过 {OFFLINE_MAX_AGE_DAYS} 天，拒绝使用。")
+                    return None
+                return data
+                
+            if age_seconds < ttl_seconds:
+                return data
+        except Exception:
+            pass
+            
         return None
 
     def _set_cache(self, key: str, data):
@@ -819,20 +828,22 @@ class LocalDataLake:
         if isinstance(data, (pd.DataFrame, pd.Series)) and data.empty: return
         
         timestamp = int(time.time())
-        filename = os.path.join(self.cache_dir, f"{key}_{timestamp}.pkl")
+        filename = os.path.join(self.cache_dir, f"{key}.pkl")
+        
+        payload = {
+            'created_at': timestamp,
+            'data': data
+        }
+        
         try:
-            if isinstance(data, (pd.DataFrame, pd.Series)):
-                data.to_pickle(filename)
-            else:
-                with open(filename, 'wb') as f:
-                    pickle.dump(data, f)
+            with open(filename, 'wb') as f:
+                pickle.dump(payload, f)
         except Exception as e:
             log.debug(f"缓存写入失败 {key}: {e}")
             
+        # 兼容清理老版本带时间戳的遗留缓存文件
         pattern = os.path.join(self.cache_dir, f"{key}_*.pkl")
-        files = glob.glob(pattern)
-        files.sort(key=os.path.getmtime, reverse=True)
-        for old_file in files[3:]:
+        for old_file in glob.glob(pattern):
             try: os.remove(old_file)
             except Exception: pass
 

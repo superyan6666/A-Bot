@@ -369,6 +369,8 @@ def generate_hold_period(adx: float, price_pct: float, has_chip_break: bool) -> 
 # ═════════════════════════════════════════════════════════════════════════════
 # 6. 统一数据代理与本地数据湖 (Data Proxy & Data Lake)
 # ═════════════════════════════════════════════════════════════════════════════
+import glob
+import pickle
 import akshare as ak
 
 try:
@@ -380,6 +382,9 @@ try:
     import efinance as ef
 except ImportError:
     ef = None
+
+DATA_CACHE_MODE = os.environ.get('DATA_CACHE_MODE', 'online').lower()
+OFFLINE_MAX_AGE_DAYS = int(os.environ.get('OFFLINE_MAX_AGE_DAYS', 30))
 
 def retry(times=4, delay=2, exceptions=(Exception,)):
     def decorator(fn):
@@ -467,13 +472,12 @@ class DataProxy:
         self._login_baostock()
         try:
             prefix = 'sh.' if code.startswith('6') else 'sz.'
-            # baostock 的日期格式要求 YYYY-MM-DD
             start_fmt = f"{start[:4]}-{start[4:6]}-{start[6:]}"
             end_fmt = f"{end[:4]}-{end[4:6]}-{end[6:]}"
             rs = bs.query_history_k_data_plus(prefix + code,
                 "date,open,close,high,low,volume",
                 start_date=start_fmt, end_date=end_fmt,
-                frequency="d", adjustflag="1") # 1 = 前复权
+                frequency="d", adjustflag="1")
             
             data_list = []
             while (rs.error_code == '0') & rs.next():
@@ -515,7 +519,6 @@ class DataProxy:
 
     # ---- [2. Spot Data (实时横截面)] ----
     def _fetch_spot_qmt(self):
-        # TODO: 预留给 QMT / Tushare (最高优)
         return None
 
     def _fetch_spot_efinance(self):
@@ -549,7 +552,6 @@ class DataProxy:
                               '最低': C.S_LOW, '成交量': C.S_VOL, '成交额': C.S_AMT}
                 df = df.rename(columns=rename_map)
                 
-                # --- 向量化融合 Tushare 真实基本面 ---
                 funds_df = self._get_tushare_fundamentals_df()
                 if not funds_df.empty:
                     df = pd.merge(df, funds_df, on=C.S_CODE, how='left')
@@ -565,13 +567,55 @@ class DataProxy:
                         if col not in df.columns: df[col] = val
                 return df
             raise ValueError('spot_empty')
-            
+
+    def _fetch_spot_tushare_fallback(self) -> pd.DataFrame:
+        """极寒时刻的终极兜底：当全市场实时接口死掉，用日频历史伪装截面"""
+        if not self.ts_pro:
+            raise ValueError("Tushare 未配置，终极兜底失败！网络严重受阻。")
+        log.warning("⚠️ [FALLBACK] 所有实时数据源失效，正尝试使用 Tushare 日终历史充当伪装截面数据！")
+        
+        try:
+            for days_back in range(0, 10):
+                trade_date = (datetime.now() - timedelta(days=days_back)).strftime('%Y%m%d')
+                df = self.ts_pro.daily(trade_date=trade_date)
+                if df is not None and not df.empty:
+                    df_basic = self.ts_pro.daily_basic(trade_date=trade_date)
+                    if df_basic is not None and not df_basic.empty:
+                        df = pd.merge(df, df_basic, on='ts_code', how='left')
+                    
+                    df[C.S_CODE] = df['ts_code'].str.slice(0, 6)
+                    df[C.S_PRICE] = df['close']
+                    df[C.S_OPEN] = df['open']
+                    df[C.S_HIGH] = df['high']
+                    df[C.S_LOW] = df['low']
+                    df[C.S_VOL] = df['vol']
+                    df[C.S_AMT] = df['amount'] * 1000
+                    df[C.S_PCT] = df['pct_chg']
+                    df[C.S_TURN] = df.get('turnover_rate', df.get('turnover_rate_f', 2.0))
+                    df[C.S_PE] = df.get('pe_ttm', -1.0)
+                    df[C.S_PB] = df.get('pb', 2.0)
+                    df[C.S_MCAP] = df.get('circ_mv', 0.0) * 10000
+                    df[C.S_VR] = df.get('volume_ratio', 1.0)
+                    df[C.S_NAME] = "TS_" + df[C.S_CODE]
+                    df['DATA_MODE'] = 'T+1_FALLBACK'
+                    log.warning(f"⚠️ [FALLBACK_SUCCESS] 成功拉取 {trade_date} Tushare数据作为伪装截面。注意时效性！")
+                    return df
+            raise ValueError("Tushare returned empty daily data across 10 days.")
+        except Exception as e:
+            log.error(f"❌ [FATAL] Tushare 终极兜底方案也失败，彻底断网: {e}")
+            raise e
+
     def get_spot(self) -> pd.DataFrame:
         df = self._fetch_spot_qmt()
         if df is not None: return df
         df = self._fetch_spot_efinance()
         if df is not None: return df
-        return self._fetch_spot_akshare()
+        try:
+            df = self._fetch_spot_akshare()
+            if df is not None: return df
+        except Exception as e:
+            log.debug(f"akshare spot failed: {e}")
+        return self._fetch_spot_tushare_fallback()
 
     # ---- [3. Index & Context] ----
     @retry(times=4, delay=2)
@@ -584,15 +628,43 @@ class DataProxy:
         except Exception as e:
             log.warning(f"腾讯指数接口波动 ({symbol}): {e}，切换东方财富源...")
         
-        df = ak.stock_zh_index_daily_em(symbol=symbol)
-        if df is not None and not df.empty:
-            df.columns = [c.lower() for c in df.columns]
-            return df
+        try:
+            df = ak.stock_zh_index_daily_em(symbol=symbol)
+            if df is not None and not df.empty:
+                df.columns = [c.lower() for c in df.columns]
+                return df
+        except Exception as e:
+            log.warning(f"东方财富指数接口也波动 ({symbol}): {e}，切换 Baostock 源...")
+            
+        if bs is not None:
+            self._login_baostock()
+            bs_symbol = 'sh.' + symbol if symbol.startswith('0') else 'sz.' + symbol
+            start_fmt = (datetime.now() - timedelta(days=365)).strftime('%Y-%m-%d')
+            rs = bs.query_history_k_data_plus(bs_symbol, "date,open,close,high,low,volume", start_date=start_fmt, frequency="d")
+            data_list = []
+            while (rs.error_code == '0') & rs.next():
+                data_list.append(rs.get_row_data())
+            if data_list:
+                df = pd.DataFrame(data_list, columns=rs.fields)
+                df = df.rename(columns={'date': 'date', 'open': 'open', 'close': 'close', 'high': 'high', 'low': 'low', 'volume': 'volume'})
+                for col in ['open', 'close', 'high', 'low', 'volume']:
+                    df[col] = pd.to_numeric(df[col], errors='coerce')
+                return df
         raise ValueError(f'index_empty_{symbol}')
 
     @retry(times=3, delay=2)
     def get_core_pool(self) -> set:
         pool = set()
+        if self.ts_pro:
+            try:
+                for idx in ["399300.SZ", "000905.SH", "000852.SH", "399006.SZ"]:
+                    df = self.ts_pro.index_weight(index_code=idx, start_date=(datetime.now() - timedelta(days=60)).strftime('%Y%m%d'))
+                    if not df.empty:
+                        pool.update(df['con_code'].str.slice(0, 6).tolist())
+                if pool: return pool
+            except Exception as e:
+                log.debug(f"Tushare 获取成分股失败: {e}")
+                
         try:
             for idx in ["000300", "000905", "000852", "399006"]:
                 df = ak.index_stock_cons(symbol=idx)
@@ -625,7 +697,6 @@ class DataProxy:
         except Exception as e:
             log.warning(f"东方财富主线板块榜单获取失败(可能被云端拦截): {e}，正在切换同花顺备用源...")
 
-        # 降级：同花顺源
         try:
             df = ak.stock_board_industry_name_ths()
             if df is not None and not df.empty:
@@ -669,36 +740,119 @@ class LocalDataLake:
     """本地数据湖缓存拦截层"""
     def __init__(self, proxy: DataProxy):
         self.proxy = proxy
-        self.spot_cache = SPOT_CACHE
-        self.hist_dir = HIST_CACHE_DIR
+        self.cache_dir = HIST_CACHE_DIR
+        os.makedirs(self.cache_dir, exist_ok=True)
+        self._offline_summary_printed = False
+
+    def _print_offline_summary(self):
+        if self._offline_summary_printed: return
+        self._offline_summary_printed = True
+        log.warning(f"📴 [OFFLINE_MODE] 已开启无网络强制缓存模式！")
+        log.warning(f"📴 [OFFLINE_MODE] 超过 {OFFLINE_MAX_AGE_DAYS} 天的缓存将被拒绝。若需强制刷新请删除 hist_cache 目录。")
+        files = glob.glob(os.path.join(self.cache_dir, "*.pkl"))
+        if not files:
+            log.warning("📴 [OFFLINE_MODE] 警告：本地无任何缓存文件！后续请求可能抛出异常。")
+            return
+        log.warning("📴 [OFFLINE_MODE] 本地缓存资产库摘要:")
+        for f in sorted(files, key=os.path.getmtime, reverse=True)[:10]:
+            mtime = datetime.fromtimestamp(os.path.getmtime(f)).strftime('%Y-%m-%d %H:%M:%S')
+            log.warning(f"  - {os.path.basename(f)} (生成时间: {mtime})")
+        if len(files) > 10: log.warning(f"  ...及其他 {len(files)-10} 个缓存文件。")
+
+    def _get_cache(self, key: str, ttl_seconds: int):
+        pattern = os.path.join(self.cache_dir, f"{key}_*.pkl")
+        files = glob.glob(pattern)
+        if not files: return None
+        
+        files.sort(key=os.path.getmtime, reverse=True)
+        latest_file = files[0]
+        mtime = os.path.getmtime(latest_file)
+        age_seconds = time.time() - mtime
+        age_days = age_seconds / 86400.0
+
+        if DATA_CACHE_MODE == 'offline':
+            self._print_offline_summary()
+            if age_days > OFFLINE_MAX_AGE_DAYS:
+                log.warning(f"⚠️ [CACHE_REJECT] {key} 最新离线缓存已超过 {OFFLINE_MAX_AGE_DAYS} 天，拒绝使用。")
+                return None
+            try: return pd.read_pickle(latest_file)
+            except Exception: return None
+            
+        if age_seconds < ttl_seconds:
+            try: return pd.read_pickle(latest_file)
+            except Exception: pass
+        return None
+
+    def _set_cache(self, key: str, data):
+        if data is None: return
+        if isinstance(data, (pd.DataFrame, pd.Series)) and data.empty: return
+        
+        timestamp = int(time.time())
+        filename = os.path.join(self.cache_dir, f"{key}_{timestamp}.pkl")
+        try:
+            if isinstance(data, (pd.DataFrame, pd.Series)):
+                data.to_pickle(filename)
+            else:
+                with open(filename, 'wb') as f:
+                    pickle.dump(data, f)
+        except Exception as e:
+            log.debug(f"缓存写入失败 {key}: {e}")
+            
+        pattern = os.path.join(self.cache_dir, f"{key}_*.pkl")
+        files = glob.glob(pattern)
+        files.sort(key=os.path.getmtime, reverse=True)
+        for old_file in files[3:]:
+            try: os.remove(old_file)
+            except Exception: pass
 
     def fetch_spot(self) -> pd.DataFrame:
-        if os.path.exists(self.spot_cache):
-            mtime = os.path.getmtime(self.spot_cache)
-            if time.time() - mtime < 3600 * 2:  
-                log.info("📦 检测到本地有效缓存，跳过全量接口请求，直接极速加载...")
-                try: return pd.read_pickle(self.spot_cache)
-                except Exception: pass
+        cached = self._get_cache("spot", 300) # 5分钟时效，防盘中滞后
+        if cached is not None:
+            if DATA_CACHE_MODE != 'offline': log.info("📦 命中 spot 本地实时缓存(时效5分钟)...")
+            return cached
         df = self.proxy.get_spot()
-        try: df.to_pickle(self.spot_cache)
-        except Exception: pass
+        self._set_cache("spot", df)
         return df
 
     def fetch_hist(self, code: str, start: str, end: str) -> Optional[pd.DataFrame]:
-        cache_file = os.path.join(self.hist_dir, f"{code}_{end}.pkl")
-        if os.path.exists(cache_file):
-            try: return pd.read_pickle(cache_file)
-            except Exception: pass
+        key = f"hist_{code}_{end}"
+        cached = self._get_cache(key, 86400) # 日线数据1天时效
+        if cached is not None: return cached
         df = self.proxy.get_hist(code, start, end)
-        if df is not None:
-            try: df.to_pickle(cache_file)
-            except Exception: pass
+        self._set_cache(key, df)
         return df
 
-    def fetch_index(self, symbol: str): return self.proxy.get_index(symbol)
-    def fetch_core_pool(self): return self.proxy.get_core_pool()
-    def fetch_hot_sectors(self): return self.proxy.get_hot_sectors()
-    def fetch_northbound_flow(self): return self.proxy.get_northbound_flow()
+    def fetch_index(self, symbol: str):
+        key = f"index_{symbol}"
+        cached = self._get_cache(key, 43200) # 12小时时效
+        if cached is not None: return cached
+        df = self.proxy.get_index(symbol)
+        self._set_cache(key, df)
+        return df
+        
+    def fetch_core_pool(self):
+        cached = self._get_cache("core_pool", 86400)
+        if cached is not None: 
+            if isinstance(cached, set): return cached
+        pool = self.proxy.get_core_pool()
+        self._set_cache("core_pool", pool)
+        return pool
+        
+    def fetch_hot_sectors(self):
+        cached = self._get_cache("hot_sectors", 300) # 5分钟时效
+        if cached is not None: 
+            if isinstance(cached, dict): return cached
+        val = self.proxy.get_hot_sectors()
+        self._set_cache("hot_sectors", val)
+        return val
+        
+    def fetch_northbound_flow(self):
+        cached = self._get_cache("northbound", 300) # 5分钟时效
+        if cached is not None: 
+            if isinstance(cached, tuple): return cached
+        val = self.proxy.get_northbound_flow()
+        self._set_cache("northbound", val)
+        return val
 
 # ── 实例化全局单例，保持对外接口完全兼容 ──
 _DATA_PROXY = DataProxy()

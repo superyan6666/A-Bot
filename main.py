@@ -4,6 +4,7 @@ import json
 import socket
 import random
 import logging
+from urllib.parse import urlparse
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from functools import wraps
@@ -156,14 +157,6 @@ def save_pushed_state(pushed_dict: dict) -> None:
     try:
         with open(STATE_FILE, 'w') as f:
             json.dump(clean_dict, f)
-    except Exception:
-        pass
-        
-    today_suffix = _today_str().replace('-', '')
-    try:
-        for fname in os.listdir(HIST_CACHE_DIR):
-            if not fname.endswith(f"{today_suffix}.pkl"):
-                os.remove(os.path.join(HIST_CACHE_DIR, fname))
     except Exception:
         pass
 
@@ -1110,7 +1103,6 @@ class AShareTechnicals:
         return {
             'is_first_dip': is_first_dip,
             'macd_divergence': macd_divergence,
-            'is_etf': str(row[C.S_CODE]).startswith(('51', '15', '588', '56')),
             'price_pct': price_pct, 'max_1y': max_1y, 'adx': float(today['ADX']),
             'bull_rank': (today['MA20'] > today['MA60']),
             'extreme_shrink_vol': extreme_shrink_vol,
@@ -1308,6 +1300,7 @@ def process_stock(row: pd.Series, raw_hist: pd.DataFrame, now: datetime, market_
     data['pe'] = float(row.get(C.S_PE, 0))
     data['pb'] = float(row.get(C.S_PB, 0))
     data['mcap'] = float(row.get(C.S_MCAP, 0))
+    data['is_etf'] = str(row[C.S_CODE]).startswith(('51', '15', '588', '56'))
     data['vol_ratio'] = float(row.get(C.S_VR, 1.0))
     data['rs_rating'] = ((row[C.S_PRICE] / data['close_60d_ago'] - 1) * 100 - index_ret) if data['close_60d_ago'] > 0 else 0
     data['code'] = str(row[C.S_CODE])
@@ -1437,7 +1430,7 @@ def get_signals() -> tuple[list[Signal], list, set, int, str, int]:
     if 'DATA_MODE' in df_raw.columns and (df_raw['DATA_MODE'] == 'T+1_FALLBACK').any():
         m_msg += "\n\n> 🚨 **严重警告**：今日所有实时行情流中断，当前所有技术信号均基于【昨日 T-1 收盘截面】生成，严禁用于今日盘中实盘交易！\n\n"
 
-    if c_conf.RUN_MODE == 'market_only':
+    if config.RUN_MODE == 'market_only':
         log.info("🤖 [大盘体检模式] 完毕，退出个股运算。")
         return [], [], pushed, 0, m_msg, len(df_raw)
 

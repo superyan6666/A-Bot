@@ -1259,7 +1259,9 @@ def process_stock(row: pd.Series, raw_hist: pd.DataFrame, now: datetime, market_
     if len(raw_hist) < 120: return None
     
     hist = raw_hist.copy()
-    if str(hist[C.H_DATE].iloc[-1]) != now.strftime('%Y-%m-%d') and is_valid_run_time(now):
+    # 仅在盘中 (15:00 之前) 允许拼接实时 K 线。盘后强制依赖历史日线，杜绝周末/节假日的重复/错乱 K 线拼接。
+    is_intraday = now.hour < 15
+    if is_intraday and str(hist[C.H_DATE].iloc[-1]) != now.strftime('%Y-%m-%d') and is_valid_run_time(now):
         synthetic = pd.DataFrame([{
             C.H_DATE: now.strftime('%Y-%m-%d'), C.H_OPEN: float(row.get(C.S_OPEN, row[C.S_PRICE])),
             C.H_HIGH: float(row[C.S_HIGH]), C.H_LOW: float(row.get(C.S_LOW, row[C.S_PRICE])),
@@ -1499,7 +1501,7 @@ def get_signals() -> tuple[list[Signal], list, set, int, str, int]:
                         watchlist_data.append((row[C.S_NAME], row[C.S_CODE], score, row[C.S_PRICE]))
                         
             except Exception as e:
-                log.debug(f"计算个股 {row[C.S_CODE]} 时发生异常或被过滤: {e}")
+                log.warning(f"⚠️ 计算个股 {row[C.S_CODE]} 时发生特征异常或被过滤: {e}")
                 pass
     except FuturesTimeoutError:
         log.warning("⚠️ 后台运算达到极值，提前熔断保存已有成果。")

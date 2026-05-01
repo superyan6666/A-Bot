@@ -8,7 +8,7 @@ from urllib.parse import urlparse
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from functools import wraps
-from typing import Optional, Tuple, Callable
+from typing import Optional, Tuple, Callable, Any
 
 import requests
 import numpy as np
@@ -46,7 +46,7 @@ class AppConfig:
         self.DINGTALK_WEBHOOK = self.get('DINGTALK_WEBHOOK', '')
         self.RUN_MODE = self.get('RUN_MODE', 'normal')
         
-    def get(self, key: str, default: any = None) -> any:
+    def get(self, key: str, default: Any = None) -> Any:
         if key not in self._env:
             if default is not None:
                 # 在 config 初始化阶段 logger 可能尚未 setup，暂时 print 或者等后续再 log
@@ -104,7 +104,7 @@ def _patched_request(self, method, url, **kwargs):
     
     # 仅针对常见行情域名的白名单进行 UA 伪装，避免污染钉钉等原生请求
     whitelist_domains = ('eastmoney.com', 'dfcfw.com', 'sina.com.cn', 'sinajs.cn', 'money.163.com', '10jqka.com.cn', 'tushare.pro')
-    needs_patch = any(hostname.endswith(d) for d in whitelist_domains)
+    needs_patch = any(hostname == d or hostname.endswith('.' + d) for d in whitelist_domains)
     
     if needs_patch:
         log.debug(f"[WAF Patch] 注入浏览器 UA -> {hostname}")
@@ -1181,7 +1181,9 @@ def apply_scoring(data: dict, now: datetime, m_regime: str, vol_surge: bool, win
                 penalty_reasons.append(msg)
             else:
                 # 互斥分组：同组只取最高分的一个因子，防止逻辑重叠导致分值无限拔高
-                group = f.group if f.group else f.template
+                if not f.group:
+                    log.warning(f"⚠️ 因子缺失 group 配置，已强制分配到默认组: {f.template[:20]}...")
+                group = f.group if f.group else "DEFAULT_GROUP"
                 if group not in group_scores or pts > group_scores[group]:
                     group_scores[group] = pts
                     group_reasons[group] = msg
@@ -1639,7 +1641,7 @@ def send_dingtalk(signals: list[Signal], watchlist: list, total_pool: int, total
                 
                 # [性能优化] 彻底消除同步网络检测 (requests.head) 带来的延迟雪崩
                 # 根据号段硬编码直接拦截无法生成周线图的边缘板块
-                if code_str.startswith(('8', '4', '9', '688')):
+                if code_str.startswith(('8', '4', '9')):
                     kline_url = "https://dummyimage.com/800x400/f3f4f6/9ca3af.png&text=No+Chart+Available"
                 else:
                     kline_url = f"http://image.sinajs.cn/newchart/weekly/n/{sina_market}{s.code}.gif"
@@ -1748,7 +1750,7 @@ if __name__ == '__main__':
             
     except Exception as e:
         log.critical(f"系统崩溃: {e}", exc_info=True)
-        webhook_url = os.environ.get('DINGTALK_WEBHOOK')
+        webhook_url = config.DINGTALK_WEBHOOK
         if webhook_url:
             error_msg = f"🚨 **AI量化引擎崩溃告警**\n\n**时间**: {_today_str()}\n**环境**: GitHub Actions\n**异常信息**: {str(e)[:300]}..."
             try:

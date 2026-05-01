@@ -124,36 +124,43 @@ def load_and_update_paper_trades(df_spot: pd.DataFrame) -> tuple[list, dict]:
 
     active_trades = []
     today_date = datetime.now(TZ_BJS).date()
+    AI_EVO_LOOKBACK_DAYS = 60 # 限定自进化回溯窗口，防止老旧策略权重固化
     
     for t in trades:
         status = t.get('status', 'PENDING')
         code = t.get('code')
+        buy_date = datetime.strptime(t['date'], '%Y-%m-%d').date()
+        days_since_buy = (today_date - buy_date).days
+        
+        # 丢弃超过 90 天的历史记录，避免文件膨胀
+        if days_since_buy > 90 and status != 'PENDING':
+            continue
         
         if status == 'PENDING' and code in spot_dict:
             row = spot_dict[code]
             high = float(row.get(Cols.S_HIGH, 0))
             low = float(row.get(Cols.S_LOW, 0))
             close = float(row.get(Cols.S_PRICE, 0))
-            buy_date = datetime.strptime(t['date'], '%Y-%m-%d').date()
-            days_held = (today_date - buy_date).days
 
             if high >= t['target']:
                 t['status'] = 'WIN'
             elif low <= t['stop']:
                 t['status'] = 'LOSS'
-            elif days_held > 10:  
+            elif days_since_buy > 10:  
                 t['status'] = 'WIN' if close > t['buy_price'] else 'LOSS'
 
         if t['status'] in ('WIN', 'LOSS'):
-            bucket = t.get('score_bucket', '<70')
-            if bucket in stats:
-                stats[bucket]['total'] += 1
-                if t['status'] == 'WIN':
-                    stats[bucket]['win'] += 1
+            # 仅统计近期的交易用于自进化打分，防止前视偏差和过时信息影响
+            if days_since_buy <= AI_EVO_LOOKBACK_DAYS:
+                bucket = t.get('score_bucket', '<70')
+                if bucket in stats:
+                    stats[bucket]['total'] += 1
+                    if t['status'] == 'WIN':
+                        stats[bucket]['win'] += 1
 
         active_trades.append(t)
 
-    return active_trades[-500:], stats
+    return active_trades, stats
 
 def save_paper_trades(trades: list):
     try:
@@ -1044,6 +1051,7 @@ class Factor:
     points: int
     weight: float = 1.0
     template: str = ""
+    group: str = ""
 
 def apply_scoring(data: dict, now: datetime, m_regime: str, vol_surge: bool, win_stats: dict, is_fallback: bool = False) -> tuple[int, str, str]:
     adx = data['adx']
@@ -1076,22 +1084,22 @@ def apply_scoring(data: dict, now: datetime, m_regime: str, vol_surge: bool, win
 
     factors = [
         Factor(lambda d: d.get('macd_divergence', False), 25, 1.0, "- 🧲 **MACD底背离**：日线级别价格创新低但动能衰竭，极其罕见的左侧黄金坑 (触发强加权)"),
-        Factor(lambda d: d['mcap'] > 300e8 and 0 < d['pe'] < 25 and d['pb'] < 3, 10, f_val, "- 🏢 **价值蓝筹**：大市值低估值核心资产，防守属性极强"),
-        Factor(lambda d: d['vol_ratio'] > 1.0 and d['rs_rating'] > 5, 10, f_mom, "- 🚀 **强势领涨**：近期显著强于大盘，资金接力意愿极强"),
-        Factor(lambda d: d['price_pct'] < 0.3 and 0 < d['pb'] < 1.0, 8, f_val, "- ♻️ **困境反转**：股价严重破净且处于绝对低位，安全垫极厚"),
+        Factor(lambda d: d['mcap'] > 300e8 and 0 < d['pe'] < 25 and d['pb'] < 3, 10, f_val, "- 🏢 **价值蓝筹**：大市值低估值核心资产，防守属性极强", "VAL"),
+        Factor(lambda d: d['vol_ratio'] > 1.0 and d['rs_rating'] > 5, 10, f_mom, "- 🚀 **强势领涨**：近期显著强于大盘，资金接力意愿极强", "MOM"),
+        Factor(lambda d: d['price_pct'] < 0.3 and 0 < d['pb'] < 1.0, 8, f_val, "- ♻️ **困境反转**：股价严重破净且处于绝对低位，安全垫极厚", "VAL"),
         
         Factor(lambda d: d.get('in_hot_sector', False), 12, f_mom, "- 🌡️ **身处主线**：所在板块【{hot_sector_name}】今日强势领涨，踏准市场节奏"),
         
-        Factor(lambda d: d['price_pct'] < 0.25, 12, f_rev * rw, "- 🟢 **绝对低位**：目前买入相当于抄底，长线持有安全"),
-        Factor(lambda d: 0.25 <= d['price_pct'] <= 0.45, 8, f_rev, "- 🟢 **相对低位**：刚刚从底部爬起来，输时间不输钱"),
-        Factor(lambda d: d['price_pct'] > 0.45, 6, f_mom, "- 📈 **多头趋势**：股价已脱离底部，处于健康的主升浪区间"),
-        Factor(lambda d: d['price_pct'] > 0.85, 8, f_mom, "- 🚀 **高位突破**：股价处于年度高位，强者恒强趋势极佳"), 
+        Factor(lambda d: d['price_pct'] < 0.25, 12, f_rev * rw, "- 🟢 **绝对低位**：目前买入相当于抄底，长线持有安全", "POS"),
+        Factor(lambda d: 0.25 <= d['price_pct'] <= 0.45, 8, f_rev, "- 🟢 **相对低位**：刚刚从底部爬起来，输时间不输钱", "POS"),
+        Factor(lambda d: d['price_pct'] > 0.45, 6, f_mom, "- 📈 **多头趋势**：股价已脱离底部，处于健康的主升浪区间", "POS"),
+        Factor(lambda d: d['price_pct'] > 0.85, 8, f_mom, "- 🚀 **高位突破**：股价处于年度高位，强者恒强趋势极佳", "MOM"), 
         
-        Factor(lambda d: d['pe'] > 0 and d['pe'] < 40, 5, f_val, "- 🛡️ **业绩护体**：市盈率健康，不是炒空气的无基本面股"),
+        Factor(lambda d: d['pe'] > 0 and d['pe'] < 40, 5, f_val, "- 🛡️ **业绩护体**：市盈率健康，不是炒空气的无基本面股", "VAL"),
         Factor(lambda d: d['macd_dea'] >= -0.05, 5, 1.0, "- 🌊 **多头控盘**：大周期趋势仍强，没有被深套的风险"), 
         
-        Factor(lambda d: -2.0 <= d['dist_ma20'] <= 6.0, 12, 1.0, "- 🧲 **贴地潜伏**：目前价格紧贴均线支撑，绝佳安全低吸点"),
-        Factor(lambda d: 6.0 < d['dist_ma20'] <= 15.0, 6, f_mom, "- 🚀 **强势发力**：距离20日线有空间，依托短期均线强势上攻"),
+        Factor(lambda d: -2.0 <= d['dist_ma20'] <= 6.0, 12, 1.0, "- 🧲 **贴地潜伏**：目前价格紧贴均线支撑，绝佳安全低吸点", "MA20"),
+        Factor(lambda d: 6.0 < d['dist_ma20'] <= 15.0, 6, f_mom, "- 🚀 **强势发力**：距离20日线有空间，依托短期均线强势上攻", "MA20"),
         Factor(lambda d: d['dist_ma20'] < -2.0, -10, f_risk, "- ⚠️ **破位嫌疑**：当前已跌破20日线，需警惕趋势走坏 (扣分)"),
         
         Factor(lambda d: 30 <= d.get('rsi', 50) <= 72, 5, 1.0, "- 📊 **温度适中**：RSI处于健康买入区间，正是下手时机"),
@@ -1099,16 +1107,16 @@ def apply_scoring(data: dict, now: datetime, m_regime: str, vol_surge: bool, win
         Factor(lambda d: d['bull_rank'], 8, f_mom, "- 📈 **顺势而为**：均线多头排列，跟着主力资金大部队走"),
         
         Factor(lambda d: d['has_zt'], 8, 1.0, "- 🔥 **股性活跃**：该股历史上容易涨停，不会一潭死水"),
-        Factor(lambda d: d['vol_ratio'] >= 1.8, 8, 1.0, "- 🔵 **放量确认**：今天成交量明显放大，大资金开始干活了"),
+        Factor(lambda d: d['vol_ratio'] >= 1.8, 8, 1.0, "- 🔵 **放量确认**：今天成交量明显放大，大资金开始干活了", "VOL"),
         Factor(lambda d: d['red_days'] >= 2, 5, 1.0, "- 🔴 **稳步推升**：最近重心都在上移，主力在偷偷温和建仓"),
         
-        Factor(lambda d: d['has_chip_break'], 12, tw * f_mom, "- 🏔️ **抛压真空**：上方的套牢盘已割肉离场，向上拉升没阻力"),
-        Factor(lambda d: d.get('is_true_vcp', False), 12, 1.0, "- 🎯 **形态确认**：呈现经典 VCP (波动率收敛) 结构，洗盘极度充分"),
-        Factor(lambda d: not d.get('is_true_vcp', False) and d['vcp_amp'] < 0.12, 6, 1.0, "- 🟣 **蓄势待发**：近期波动极小，面临短线方向选择"),
-        Factor(lambda d: d['extreme_shrink_vol'], 8, 1.0, "- 🧊 **没人砸盘**：爆发前夕成交极度萎缩，散户该卖的都卖了"), 
-        Factor(lambda d: d['has_obv_break'], 10, tw * f_mom, "- 💸 **真金白银**：模型监控到真实的资金在创纪录净流入"),
-        Factor(lambda d: d['has_pullback'], 12, 1.0, "- 🪃 **黄金深坑**：出现温和缩量回踩，主力洗盘给出的上车良机"),
-        Factor(lambda d: d['lower_shadow_ratio'] > 0.03, 5, 1.0, "- 📌 **强力护盘**：跌下去被大资金迅速买回，下方有人兜底"), 
+        Factor(lambda d: d['has_chip_break'], 12, tw * f_mom, "- 🏔️ **抛压真空**：上方的套牢盘已割肉离场，向上拉升没阻力", "VCP"),
+        Factor(lambda d: d.get('is_true_vcp', False), 12, 1.0, "- 🎯 **形态确认**：呈现经典 VCP (波动率收敛) 结构，洗盘极度充分", "VCP"),
+        Factor(lambda d: not d.get('is_true_vcp', False) and d['vcp_amp'] < 0.12, 6, 1.0, "- 🟣 **蓄势待发**：近期波动极小，面临短线方向选择", "VCP"),
+        Factor(lambda d: d['extreme_shrink_vol'], 8, 1.0, "- 🧊 **没人砸盘**：爆发前夕成交极度萎缩，散户该卖的都卖了", "VCP"), 
+        Factor(lambda d: d['has_obv_break'], 10, tw * f_mom, "- 💸 **真金白银**：模型监控到真实的资金在创纪录净流入", "VOL"),
+        Factor(lambda d: d['has_pullback'], 12, 1.0, "- 🪃 **黄金深坑**：出现温和缩量回踩，主力洗盘给出的上车良机", "VCP"),
+        Factor(lambda d: d['lower_shadow_ratio'] > 0.03, 5, 1.0, "- 📌 **强力护盘**：跌下去被大资金迅速买回，下方有人兜底", "VCP"), 
         
         Factor(lambda d: d.get('rs_rating', 0) > 5,  8, f_mom, "- 🏆 **跑赢大盘**：近60日涨幅超越指数，有资金在持续运作"),
         
@@ -1117,24 +1125,49 @@ def apply_scoring(data: dict, now: datetime, m_regime: str, vol_surge: bool, win
         Factor(lambda d: d.get('consecutive_down', 0) >= 4, -15, f_risk, "- 🔪 **飞刀预警**：近期连续阴线急跌，左侧接飞刀风险大 (重度扣分)"),
         Factor(lambda d: d.get('rsi', 50) > 80, -10, f_risk, "- 🌡️ **短期过热**：RSI偏高短线超买，操作需要进一步缩减仓位"),
         Factor(lambda d: d.get('rs_rating', 0) < -10, -8, f_risk, "- 📉 **跑输大盘**：近期持续弱于大盘，跟的是被冷落的股票"),
-        Factor(lambda d: d['has_consecutive_zt'] and d['price_pct'] < 0.40, 10, f_mom, "- 🔥 **低位连板**：刚刚启动的龙头，安全且市场辨识度极高"),
+        Factor(lambda d: d['has_consecutive_zt'] and d['price_pct'] < 0.40, 10, f_mom, "- 🔥 **低位连板**：刚刚启动的龙头，安全且市场辨识度极高", "MOM"),
         Factor(lambda d: d['has_consecutive_zt'] and d['price_pct'] >= 0.90 and not (d.get('is_first_dip', False) and m_regime != 'BEAR'), -15, f_risk, "- ⚠️ **高位接盘**：股价已被炒高连板，千万别追容易接盘！"),
-        Factor(lambda d: d.get('is_first_dip', False) and m_regime != 'BEAR', 20, f_mom, "- 🐉 **龙头首阴**：连板龙头首次缩量温和回调，量价健康且未破5日线，游资经典极品接力点！"),
+        Factor(lambda d: d.get('is_first_dip', False) and m_regime != 'BEAR', 20, f_mom, "- 🐉 **龙头首阴**：连板龙头首次缩量温和回调，量价健康且未破5日线，游资经典接力点！"),
         Factor(lambda d: d['upper_shadow_pct'] > 35, -15, f_risk, "- ⚠️ **诱多预警**：冲高后大幅跳水，上方抛压极重别上当！"),
         Factor(lambda d: d['dist_ma20'] > 25, -15, f_risk, "- 🚫 **追高预警**：目前涨得太急离均线太远，随时面临暴跌回调"),
         
         Factor(lambda d: in_danger and d['mcap'] < 100e8, -8, f_risk, f"- 📅 **财报防雷**：当前属于{danger_label}，小盘股需防业绩变脸 (扣分)")
     ]
 
-    raw_score, reasons = 45, [meta] if meta else []
+    group_scores = {}
+    group_reasons = {}
+    penalty_score = 0
+    penalty_reasons = []
     
     for f in factors:
         if f.condition(data):
-            raw_score += int(f.points * f.weight)
+            pts = int(f.points * f.weight)
             try:
-                reasons.append(f.template.format(**data))
+                msg = f.template.format(**data)
             except KeyError:
-                reasons.append(f.template)
+                msg = f.template
+                
+            if f.points < 0:
+                penalty_score += pts
+                penalty_reasons.append(msg)
+            else:
+                # 互斥分组：同组只取最高分的一个因子，防止逻辑重叠导致分值无限拔高
+                group = f.group if f.group else f.template
+                if group not in group_scores or pts > group_scores[group]:
+                    group_scores[group] = pts
+                    group_reasons[group] = msg
+
+    # 正向加分总和硬性封顶 (+45分上限)
+    total_bonus = sum(group_scores.values())
+    capped_bonus = min(total_bonus, 45)
+    
+    if total_bonus > 45:
+        group_reasons['CAPPED'] = f"- 🛡️ **[溢出截断]**：多项利好共振(理论+{total_bonus}分)，为防多重共线性过拟合，强行封顶至 +45 分。"
+
+    raw_score = 45 + capped_bonus + penalty_score
+    reasons = [meta] if meta else []
+    reasons.extend(group_reasons.values())
+    reasons.extend(penalty_reasons)
                 
     if data.get('is_etf', False):
         raw_score += 25

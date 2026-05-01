@@ -1245,11 +1245,13 @@ def vectorized_prescreen(pool: pd.DataFrame, is_fallback: bool = False) -> pd.Se
     mcap = pool.get(C.S_MCAP, pd.Series(0.0, index=pool.index)).fillna(0.0).astype(float)
     amt = pool.get(C.S_AMT, pd.Series(0.0, index=pool.index)).fillna(0.0).astype(float)
     
-    s += np.where((vr > 1.5) & (pct > 0), 15.0, 0.0)
-    s -= np.where(vr < 0.7, 10.0, 0.0)
-    s += np.where((pe > 0) & (pe < 40), 8.0, 0.0)
-    s += np.where((pb > 0) & (pb < 2), 5.0, 0.0)
-    s += np.where((mcap > 50e8) & (mcap < 500e8), 8.0, 0.0)
+    if not is_fallback:
+        s += np.where((vr > 1.5) & (pct > 0), 15.0, 0.0)
+        s -= np.where(vr < 0.7, 10.0, 0.0)
+        s += np.where((pe > 0) & (pe < 40), 8.0, 0.0)
+        s += np.where((pb > 0) & (pb < 2), 5.0, 0.0)
+        s += np.where((mcap > 50e8) & (mcap < 500e8), 8.0, 0.0)
+        
     s += np.where(amt > 1e8, 5.0, 0.0)
     
     s += np.where((pct > 1.0) & (pct < 7.0), 10.0, 0.0)

@@ -15,6 +15,22 @@ import pandas as pd
 import pytz
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
 
+# 全局网络防拦截伪装 (Global WAF Bypass)
+# 强制为所有底层的 requests 请求注入现代浏览器的 User-Agent，防止被东方财富/新浪识别为云端爬虫直接掐断连接
+_original_request = requests.Session.request
+
+def _patched_request(self, method, url, **kwargs):
+    headers = kwargs.get('headers', {})
+    if not isinstance(headers, dict):
+        headers = dict(headers)
+    if 'User-Agent' not in headers and 'user-agent' not in headers:
+        headers['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+    kwargs['headers'] = headers
+    kwargs['timeout'] = kwargs.get('timeout', 15.0)
+    return _original_request(self, method, url, **kwargs)
+
+requests.Session.request = _patched_request
+
 # ═════════════════════════════════════════════════════════════════════════════
 # 1. 环境与核心配置 (Environment & Config)
 # ═════════════════════════════════════════════════════════════════════════════

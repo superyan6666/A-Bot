@@ -31,6 +31,8 @@ class AppConfig:
         return cls._instance
         
     def _init_env(self):
+        # 环境变量仅在启动时全量读取并缓存一次。
+        # 此设计保证了在本次运行生命周期内配置的绝对一致性。
         self._env = dict(os.environ)
         
         # 预定义核心配置
@@ -280,7 +282,7 @@ C = Cols()
 class EnvParser:
     @staticmethod
     def get_float(key: str, default: float) -> float:
-        val = os.environ.get(key)
+        val = config.get(key)
         if not val: return default
         try:
             return float(val)
@@ -474,8 +476,6 @@ try:
     import efinance as ef
 except ImportError:
     ef = None
-
-OFFLINE_MAX_AGE_DAYS = int(os.environ.get('OFFLINE_MAX_AGE_DAYS', 7))
 
 def retry(times=4, delay=2, exceptions=(Exception,)):
     def decorator(fn):

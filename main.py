@@ -655,6 +655,19 @@ class DataProxy:
     @retry(times=3, delay=2)
     def get_core_pool(self) -> set:
         pool = set()
+        
+        # 1. 优先使用 Akshare 常规源
+        try:
+            for idx in ["000300", "000905", "000852", "399006"]:
+                df = ak.index_stock_cons(symbol=idx)
+                if df is not None and not df.empty:
+                    col = next((c for c in df.columns if '代码' in c), None)
+                    if col: pool.update(df[col].astype(str).str.zfill(6).tolist())
+            if pool: return pool
+        except Exception as e:
+            log.warning(f"Akshare 获取核心成分股池失败: {e}，尝试切换 Tushare 备用源...")
+
+        # 2. 降级使用 Tushare
         if self.ts_pro:
             try:
                 for idx in ["399300.SZ", "000905.SH", "000852.SH", "399006.SZ"]:
@@ -665,14 +678,8 @@ class DataProxy:
             except Exception as e:
                 log.debug(f"Tushare 获取成分股失败: {e}")
                 
-        try:
-            for idx in ["000300", "000905", "000852", "399006"]:
-                df = ak.index_stock_cons(symbol=idx)
-                if df is not None and not df.empty:
-                    col = next((c for c in df.columns if '代码' in c), None)
-                    if col: pool.update(df[col].astype(str).str.zfill(6).tolist())
-        except Exception as e:
-            log.warning(f"获取核心成分股池失败，降级为全市场扫描: {e}")
+        # 3. 终极兜底：如果不为空直接返回空池，否则记录告警
+        log.warning("⚠️ 核心池所有动态接口失效，已降级为全市场扫描模式！")
         return pool
 
     @retry(times=2, delay=2)

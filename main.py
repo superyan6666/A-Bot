@@ -147,7 +147,8 @@ def load_and_update_paper_trades(df_spot: pd.DataFrame) -> tuple[list, dict]:
             elif low <= t['stop']:
                 t['status'] = 'LOSS'
             elif days_since_buy > 10:  
-                t['status'] = 'WIN' if close > t['buy_price'] else 'LOSS'
+                # 震荡市超过10天未达标，判为 TIME_EXIT，不计入胜率统计，防止虚高
+                t['status'] = 'TIME_EXIT'
 
         if t['status'] in ('WIN', 'LOSS'):
             # 仅统计近期的交易用于自进化打分，防止前视偏差和过时信息影响
@@ -1510,14 +1511,19 @@ def get_signals() -> tuple[list[Signal], list, set, int, str, int]:
         
     watchlist_data.sort(key=lambda x: (x[2], x[1]), reverse=True) 
     
+    today_str = _today_str()
     # 仅将决选且展出给用户的 Top 10 个股记录进状态锁与模拟盘账本
     for s in final_confirmed[:10]:
         cd_days = 1 if s.score >= 85 else 3
         expire_dt = now + timedelta(days=cd_days)
         pushed[s.code] = expire_dt.strftime('%Y-%m-%d')
         
+        # 避免一天多次手工运行产生重复的 PENDING 记录，污染账本
+        if any(t.get('code') == s.code and t.get('date') == today_str and t.get('status') == 'PENDING' for t in paper_trades):
+            continue
+            
         paper_trades.append({
-            'date': _today_str(),
+            'date': today_str,
             'code': s.code,
             'score_bucket': get_score_bucket(s.score),
             'buy_price': s.price,

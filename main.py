@@ -606,7 +606,7 @@ class DataProxy:
                     df[C.S_LOW] = df['low']
                     df[C.S_VOL] = df['vol']
                     df[C.S_AMT] = df['amount'] * 1000
-                    df[C.S_PCT] = df['pct_chg']
+                    df[C.S_PCT] = 0.0 # 强制置零，防止使用T-1的涨跌幅误导下游策略
                     df[C.S_TURN] = df.get('turnover_rate', df.get('turnover_rate_f', 2.0))
                     df[C.S_PE] = df.get('pe_ttm', -1.0)
                     df[C.S_PB] = df.get('pb', 2.0)
@@ -694,9 +694,9 @@ class DataProxy:
             except Exception as e:
                 log.debug(f"Tushare 获取成分股失败: {e}")
                 
-        # 3. 终极兜底：如果不为空直接返回空池，否则记录告警
-        log.warning("⚠️ 核心池所有动态接口失效，已降级为全市场扫描模式！")
-        return pool
+        # 3. 终极兜底：静态核心50池，防止全市场扫描导致性能爆炸
+        log.warning("⚠️ 核心池所有动态接口失效，已降级为静态核心50股票池！")
+        return {"600519", "601318", "600036", "601166", "000858", "002594", "000333", "600276", "601012", "601899", "601888", "603288", "002415", "600030", "600887", "600900", "000568", "002304", "002714", "300750", "300760", "600438", "601398", "601288", "601939", "601988", "600000", "601328", "601138", "002475", "000001", "000002", "300015", "300059", "600104", "600690", "601668", "601816", "601857", "601088", "600028", "601066", "600585", "601111", "000157", "000651", "002142", "002271", "300122", "600809"}
 
     @retry(times=2, delay=2)
     def get_hot_sectors(self) -> dict:
@@ -829,9 +829,11 @@ class LocalDataLake:
             except Exception: pass
 
     def fetch_spot(self) -> pd.DataFrame:
-        cached = self._get_cache("spot", 300) # 5分钟时效，防盘中滞后
+        now = datetime.now(TZ_BJS)
+        ttl = 3600 if now.hour >= 15 and now.minute >= 30 else 300 # 盘后延长TTL避免无意义请求
+        cached = self._get_cache("spot", ttl)
         if cached is not None:
-            if DATA_CACHE_MODE != 'offline': log.info("📦 命中 spot 本地实时缓存(时效5分钟)...")
+            if DATA_CACHE_MODE != 'offline': log.info(f"📦 命中 spot 本地实时缓存(当前时效 {ttl} 秒)...")
             return cached
         df = self.proxy.get_spot()
         self._set_cache("spot", df)
@@ -1359,6 +1361,9 @@ def get_signals() -> tuple[list[Signal], list, set, int, str, int]:
 
     c_conf = Config()
     df_clean, m_ok, m_msg, idx_ret, m_overheated, m_regime, vol_surge = extract_market_context(df_raw, c_conf)
+
+    if 'DATA_MODE' in df_raw.columns and (df_raw['DATA_MODE'] == 'T+1_FALLBACK').any():
+        m_msg += "\n\n> 🚨 **严重警告**：今日所有实时行情流中断，当前所有技术信号均基于【昨日 T-1 收盘截面】生成，严禁用于今日盘中实盘交易！\n\n"
 
     if run_mode == 'market_only':
         log.info("🤖 [大盘体检模式] 完毕，退出个股运算。")
